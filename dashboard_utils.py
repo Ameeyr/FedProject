@@ -81,6 +81,13 @@ def _preferred_metric_keys():
     ]
 
 
+def _pick_plot_metrics(metric_series):
+    preferred = [key for key in _preferred_metric_keys() if key in metric_series]
+    if preferred:
+        return preferred
+    return list(metric_series.keys())[:4]
+
+
 def plot_training_history_by_client(histories, labels=None):
     if not histories:
         fig, ax = plt.subplots(figsize=(6, 3.5))
@@ -99,17 +106,29 @@ def plot_training_history_by_client(histories, labels=None):
             axes[idx].set_axis_off()
             continue
 
-        selected_keys = [key for key in _preferred_metric_keys() if key in metric_series]
-        if not selected_keys:
-            selected_keys = list(metric_series.keys())[:4]
+        selected_keys = _pick_plot_metrics(metric_series)
+        plotted_any = False
+        max_epoch_count = 0
 
         for key in selected_keys:
-            values = np.asarray(metric_series[key], dtype="float32")
-            if values.size:
-                axes[idx].plot(np.arange(1, len(values) + 1), values, label=key, linewidth=1.8)
+            values = np.asarray(metric_series[key], dtype="float32").reshape(-1)
+            finite_values = values[np.isfinite(values)]
+            if finite_values.size == 0:
+                continue
+            max_epoch_count = max(max_epoch_count, len(values))
+            axes[idx].plot(np.arange(1, len(values) + 1), values, label=key, linewidth=1.8)
+            plotted_any = True
+
+        if not plotted_any:
+            axes[idx].text(0.5, 0.5, "No numeric metrics available for this client", ha="center", va="center")
+            axes[idx].set_axis_off()
+            continue
+
+        if max_epoch_count > 0:
+            axes[idx].set_xticks(np.arange(1, max_epoch_count + 1))
 
         client_label = labels[idx] if labels and idx < len(labels) else f"Client {idx + 1}"
-        axes[idx].set_title(client_label)
+        axes[idx].set_title(f"Local Client: {client_label}")
         axes[idx].set_xlabel("Epoch")
         axes[idx].set_ylabel("Metric")
         axes[idx].grid(True, alpha=0.3)
@@ -139,19 +158,17 @@ def plot_training_history(history):
         fig.tight_layout()
         return fig
 
-    selected_keys = [key for key in _preferred_metric_keys() if key in metric_series]
-    if not selected_keys:
-        selected_keys = list(metric_series.keys())[:4]
+    selected_keys = _pick_plot_metrics(metric_series)
 
     fig, ax = plt.subplots(figsize=(7, 4))
     for key in selected_keys:
-        values = np.asarray(metric_series[key], dtype="float32")
+        values = np.asarray(metric_series[key], dtype="float32").reshape(-1)
         if values.size:
             ax.plot(np.arange(1, len(values) + 1), values, label=key, linewidth=1.8)
-    if not any(line.get_label() for line in ax.lines):
+    if not ax.lines:
         ax.text(0.5, 0.5, "No training metrics to plot", ha="center", va="center")
         ax.set_axis_off()
-    ax.set_title("Training history")
+    ax.set_title("Federated Global Training History")
     ax.set_xlabel("Epoch")
     ax.set_ylabel("Metric")
     ax.grid(True, alpha=0.3)
@@ -164,21 +181,16 @@ def compute_classification_metrics(y_true, y_pred, class_names):
     y_true = np.asarray(y_true).ravel()
     y_pred = np.asarray(y_pred).ravel()
     if y_true.size == 0 or y_pred.size == 0:
-        return {
-            "accuracy": 0.0,
-            "precision": 0.0,
-            "recall": 0.0,
-            "f1_score": 0.0,
-            "sensitivity": 0.0,
-            "specificity": 0.0,
-            "balanced_accuracy": 0.0,
-        }
+        raise ValueError("Classification metrics require non-empty prediction and label arrays.")
 
     accuracy = float(np.mean(y_true == y_pred)) if y_true.size else 0.0
     label_set = list(range(len(class_names)))
 
     if len(label_set) == 2:
-        tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=label_set).ravel()
+        cm = confusion_matrix(y_true, y_pred, labels=label_set)
+        if cm.size == 0:
+            raise ValueError("Classification metrics require a valid confusion matrix for the current labels.")
+        tn, fp, fn, tp = cm.ravel()
         precision = tp / (tp + fp) if (tp + fp) else 0.0
         recall = tp / (tp + fn) if (tp + fn) else 0.0
         specificity = tn / (tn + fp) if (tn + fp) else 0.0

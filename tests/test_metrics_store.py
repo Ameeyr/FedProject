@@ -64,3 +64,40 @@ def test_save_and_load_training_metrics(tmp_path):
     assert rows[0]["aggregation_mode"] == "fedavg"
     assert json.loads(rows[0]["history_by_client_json"])[0]["loss"] == [1.0, 0.5]
     assert json.loads(rows[0]["aggregated_history_json"])["accuracy"] == [0.25, 0.85]
+
+
+def test_save_run_metrics_stores_local_and_global_metrics_with_run_id(tmp_path):
+    db_path = tmp_path / "run_metrics.db"
+
+    first_run = save_run_metrics(
+        db_path=db_path,
+        model_name="efficientnetb0",
+        aggregation_mode="fedavg",
+        config={"rounds": 1},
+        local_metrics=[
+            {"client": "Hospital 1", "epoch": 1, "loss": 1.2, "accuracy": 0.45, "val_loss": 1.3, "val_accuracy": 0.40},
+        ],
+        global_metrics=[
+            {"round": 1, "global_loss": 1.2, "global_accuracy": 0.45, "global_val_loss": 1.3, "global_val_accuracy": 0.40, "clients": 1},
+        ],
+    )
+
+    second_run = save_run_metrics(
+        db_path=db_path,
+        model_name="efficientnetb0",
+        aggregation_mode="fedavg",
+        config={"rounds": 2},
+        local_metrics=[
+            {"client": "Hospital 1", "epoch": 2, "loss": 0.8, "accuracy": 0.75, "val_loss": 0.9, "val_accuracy": 0.70},
+            {"client": "Hospital 2", "epoch": 2, "loss": 0.7, "accuracy": 0.80, "val_loss": 0.8, "val_accuracy": 0.75},
+        ],
+        global_metrics=[
+            {"round": 1, "global_loss": 1.0, "global_accuracy": 0.60, "global_val_loss": 1.1, "global_val_accuracy": 0.55, "clients": 2},
+            {"round": 2, "global_loss": 0.6, "global_accuracy": 0.82, "global_val_loss": 0.7, "global_val_accuracy": 0.78, "clients": 2},
+        ],
+    )
+
+    latest = load_recent_metrics(db_path=db_path, limit=1)[0]
+    assert second_run == latest["id"]
+    assert latest["config_json"]
+    assert latest["id"] == second_run

@@ -36,6 +36,7 @@ def initialize_metrics_db(db_path=DEFAULT_METRICS_DB):
             """
             CREATE TABLE IF NOT EXISTS run_metrics (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT UNIQUE,
                 created_at TEXT NOT NULL,
                 model_name TEXT,
                 aggregation_mode TEXT,
@@ -43,6 +44,8 @@ def initialize_metrics_db(db_path=DEFAULT_METRICS_DB):
                 history_by_client_json TEXT,
                 aggregated_history_json TEXT,
                 classification_metrics_json TEXT,
+                local_metrics_json TEXT,
+                global_metrics_json TEXT,
                 accuracy REAL,
                 val_accuracy REAL,
                 loss REAL,
@@ -55,6 +58,48 @@ def initialize_metrics_db(db_path=DEFAULT_METRICS_DB):
             connection.execute(
                 "ALTER TABLE run_metrics ADD COLUMN classification_metrics_json TEXT"
             )
+        if "local_metrics_json" not in columns:
+            connection.execute(
+                "ALTER TABLE run_metrics ADD COLUMN local_metrics_json TEXT"
+            )
+        if "global_metrics_json" not in columns:
+            connection.execute(
+                "ALTER TABLE run_metrics ADD COLUMN global_metrics_json TEXT"
+            )
+        if "run_id" not in columns:
+            # keep old rows consistent by generating a synthetic identifier
+            connection.execute("ALTER TABLE run_metrics ADD COLUMN run_id TEXT")
+            connection.execute(
+                "UPDATE run_metrics SET run_id = 'run-' || id WHERE run_id IS NULL"
+            )
+        connection.commit()
+
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS local_client_metrics (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT,\
+                run_id TEXT NOT NULL,\
+                client TEXT,\
+                epoch INTEGER,\
+                loss REAL,\
+                accuracy REAL,\
+                val_loss REAL,\
+                val_accuracy REAL,\
+                created_at TEXT NOT NULL\
+            )"
+        )
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS global_federated_metrics (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT,\
+                run_id TEXT NOT NULL,\
+                federated_round INTEGER,\
+                global_loss REAL,\
+                global_accuracy REAL,\
+                global_val_loss REAL,\
+                global_val_accuracy REAL,\
+                clients INTEGER,\
+                created_at TEXT NOT NULL\
+            )"
+        )
         connection.commit()
     finally:
         connection.close()
@@ -72,11 +117,18 @@ def save_run_metrics(
     val_accuracy=None,
     loss=None,
     val_loss=None,
+    local_metrics=None,
+    global_metrics=None,
+    run_id=None,
 ):
     initialize_metrics_db(db_path)
     connection = _connect(db_path)
     try:
+        if run_id is None:
+            run_id = f"run-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}"
+
         row = (
+            run_id,
             datetime.now(timezone.utc).isoformat(timespec="seconds"),
             model_name,
             aggregation_mode,
@@ -84,6 +136,8 @@ def save_run_metrics(
             json.dumps(_to_serializable(history_by_client or []), sort_keys=True),
             json.dumps(_to_serializable(aggregated_history or {}), sort_keys=True),
             json.dumps(_to_serializable(classification_metrics or {}), sort_keys=True),
+            json.dumps(_to_serializable(local_metrics or []), sort_keys=True),
+            json.dumps(_to_serializable(global_metrics or []), sort_keys=True),
             _to_serializable(accuracy),
             _to_serializable(val_accuracy),
             _to_serializable(loss),
@@ -92,6 +146,7 @@ def save_run_metrics(
         cursor = connection.execute(
             """
             INSERT INTO run_metrics (
+                run_id,
                 created_at,
                 model_name,
                 aggregation_mode,
@@ -99,14 +154,59 @@ def save_run_metrics(
                 history_by_client_json,
                 aggregated_history_json,
                 classification_metrics_json,
+                local_metrics_json,
+                global_metrics_json,
                 accuracy,
                 val_accuracy,
                 loss,
                 val_loss
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             row,
         )
+
+        connection.executemany(
+            """
+            INSERT INTO local_client_metrics (run_id, client, epoch, loss, accuracy, val_loss, val_accuracy, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    run_id,
+                    item.get("client") if isinstance(item, dict) else None,
+                    item.get("epoch") if isinstance(item, dict) else None,
+                    item.get("loss"),
+                    item.get("accuracy"),
+                    item.get("val_loss"),
+                    item.get("val_accuracy"),
+                    datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                )
+                for item in (local_metrics or [])
+                if isinstance(item, dict)
+            ],
+        )
+
+        connection.executemany(
+            """
+            INSERT INTO global_federated_metrics (run_id, federated_round, global_loss, global_accuracy, global_val_loss, global_val_accuracy, clients, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    run_id,
+                    item.get("round") if isinstance(item, dict) else None,
+                    item.get("global_loss", item.get("loss")),
+                    item.get("global_accuracy", item.get("accuracy")),
+                    item.get("global_val_loss", item.get("val_loss")),
+                    item.get("global_val_accuracy", item.get("val_accuracy")),
+                    item.get("clients"),
+                    datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                )
+                for item in (global_metrics or [])
+                if isinstance(item, dict)
+            ],
+        )
+
         connection.commit()
         return cursor.lastrowid
     finally:
@@ -128,3 +228,10 @@ def load_recent_metrics(db_path=DEFAULT_METRICS_DB, limit=10):
         return [dict(row) for row in rows]
     finally:
         connection.close()
+
+
+def load_latest_run_metrics(db_path=DEFAULT_METRICS_DB):
+    rows = load_recent_metrics(db_path=db_path, limit=1)
+    if not rows:
+        return None
+    return rows[0]

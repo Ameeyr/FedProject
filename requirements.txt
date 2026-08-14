@@ -7,3 +7,4 @@ matplotlib
 scikit-learn
 pandas==2.2.2
 pyarrow==15.0.2
+flwr==1.11.1

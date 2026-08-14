@@ -17,7 +17,12 @@ from dashboard_utils import (
 from metrics_store import DEFAULT_METRICS_DB, load_recent_metrics, save_run_metrics
 from models.efficientnetb0 import FederatedClient, SUPPORTED_MODELS
 from preprocessing.preprocess_images import ImagePreprocessor
-from federated.server import FederatedFlowerServer, partition_dataset
+from federated.server import (
+    FederatedFlowerServer,
+    is_flower_available,
+    partition_dataset,
+    run_flower_federation,
+)
 from explainability.gradcam import GradCAM
 
 
@@ -314,24 +319,74 @@ def run_training(images, labels, class_names, model_name, max_samples, epochs, b
     return history, accuracy, client, (val_images, val_labels)
 
 
-def run_federation(client, server, rounds=1):
+def run_federation(client, server, rounds=1, train_data=None, epochs=5, batch_size=32, callbacks=None, eval_data=None):
     if server.global_weights is None:
-        server.update_global_model(client.model.get_weights())
+        server.global_weights = [np.array(weight, copy=True) for weight in client.model.get_weights()]
+
+    if train_data is None:
+        for _ in range(rounds):
+            server.update_global_model(client.model.get_weights())
+            server.apply_global_update(client)
+            if eval_data is not None:
+                server.evaluate_global_model([client], eval_data)
+        return server
+
     for _ in range(rounds):
-        server.update_global_model(client.model.get_weights())
-        server.apply_global_update(client)
+        client.model.set_weights(server.global_weights)
+        train_images, train_labels = train_data
+        history = client.train_model(
+            (train_images, train_labels),
+            (train_images, train_labels),
+            epochs=int(epochs),
+            batch_size=int(batch_size),
+            callbacks=callbacks or [],
+        )
+        client_weights = client.model.get_weights()
+        aggregated_weights = server.aggregate_with_fedprox([client_weights], server.global_weights)
+        server.update_global_model(aggregated_weights)
+        client.model.set_weights(server.global_weights)
+        if eval_data is not None:
+            server.evaluate_global_model([client], eval_data)
     return server
 
 
-def run_multi_client_federation(clients, server, rounds=1):
-    for round_index in range(rounds):
-        server.run_federated_round(clients)
-        for client in clients:
-            client.model.set_weights(server.global_weights)
+def run_multi_client_federation(clients, server, rounds=1, client_datasets=None, epochs=5, batch_size=32, callbacks=None, eval_data=None):
+    if not clients:
+        return server
+
+    if server.global_weights is None:
+        server._initialize_global_weights(clients)
+
+    if client_datasets is None:
+        for _ in range(rounds):
+            server.run_federated_round(clients, eval_data=eval_data)
+        return server
+
+    def train_client_round(client):
+        dataset = client_datasets.get(client.client_id, client_datasets.get(client.client_id - 1, None))
+        if dataset is None:
+            dataset = client_datasets.get("default")
+        if dataset is None:
+            current_weights = client.model.get_weights()
+            return current_weights, {"round": server.round + 1, "trained": False, "client_id": client.client_id}
+
+        client_images, client_labels = dataset
+        client.model.set_weights(server.global_weights)
+        history = client.train_model(
+            (client_images, client_labels),
+            (client_images, client_labels),
+            epochs=int(epochs),
+            batch_size=int(batch_size),
+            callbacks=callbacks or [],
+        )
+        return client.model.get_weights(), history
+
+    server.run_federated_training(clients, rounds=int(rounds), round_train_fn=train_client_round, eval_data=eval_data)
     return server
 
 
 def explain_prediction(client, image, class_names, target_layer_name):
+    """Compute Grad-CAM locally on the client model without sending raw medical images to the server."""
     gradcam = GradCAM(client.model, target_layer_name=target_layer_name)
     heatmap = gradcam.generate_heatmap(image, class_index=None)
     prediction = client.model.predict(np.expand_dims(image, axis=0), verbose=0)[0]
@@ -383,7 +438,7 @@ def build_confusion_metrics(client, val_data, class_names):
 
 
 st.title("Explainable Federated Learning for Medical Imaging")
-st.caption("Run a privacy-preserving federated workflow where local hospital clients train on their own data, a Flower server aggregates updates, and Grad-CAM explains each prediction.")
+st.caption("Privacy-preserving workflow: local hospital clients train on their own data, a central server only receives model updates, and Grad-CAM is computed locally on the client-side model for explanation.")
 
 with st.sidebar:
     st.header("Configuration")
@@ -404,13 +459,19 @@ with st.sidebar:
         hospital_count = st.number_input("Number of hospitals", min_value=2, max_value=6, value=2, step=1)
         target_accuracy = st.slider("Target accuracy", min_value=0.50, max_value=0.99, value=0.80, step=0.01, help="Adjust the required minimum validation accuracy for model acceptance.")
         max_samples = st.number_input("Max samples", min_value=16, max_value=2048, value=256, step=16)
-        epochs = st.number_input("Epochs", min_value=1, max_value=10, value=1, step=1)
+        epochs = st.number_input("Local Epochs", min_value=1, max_value=20, value=5, step=1)
         batch_size = st.number_input("Batch size", min_value=1, max_value=16, value=2, step=1)
         chunk_size = st.number_input("Chunk size", min_value=16, max_value=2048, value=256, step=16, help="Process a limited number of images at a time for large datasets")
         target_layer_name = st.text_input(
             "Grad-CAM target layer",
             value="auto",
             help="Use a specific layer name or leave as auto to use the last convolutional layer automatically.",
+        )
+        federation_backend = st.selectbox(
+            "Federation backend",
+            options=["custom", "flower"],
+            index=0,
+            help="Use the custom federated implementation or the real Flower backend when it is available.",
         )
         aggregation_mode = st.selectbox("Federated aggregation", options=["fedavg", "fedprox"], index=0)
         proximal_mu = st.number_input("FedProx mu", min_value=0.0, max_value=1.0, value=0.01, step=0.01, help="Only used when FedProx is selected")
@@ -500,7 +561,7 @@ if run_button:
                 client_history = client.train_model(
                     (client_images, client_labels),
                     val_data,
-                    epochs=max(1, epochs // 2),
+                    epochs=int(epochs),
                     batch_size=batch_size,
                     callbacks=[],
                 )
@@ -522,11 +583,66 @@ if run_button:
     st.success("Local hospital training complete")
 
     server = FederatedFlowerServer(model_name=model_name, aggregation_mode=aggregation_mode, mu=proximal_mu)
-    with st.spinner("Sharing model updates with the global server..."):
+    with st.spinner("Running federated rounds: local training on each hospital, then server aggregation..."):
         if len(class_names) >= 2 and len(clients) >= 2:
-            server = run_multi_client_federation(clients, server, rounds=int(federated_rounds))
+            client_datasets = {
+                client.client_id: (hospital_dataset["images"], hospital_dataset["labels"])
+                for client, hospital_dataset in zip(clients, selected_datasets)
+            }
+            if federation_backend == "flower":
+                if not is_flower_available():
+                    st.warning("Flower is not installed in the active environment. Falling back to the custom federation backend.")
+                    federation_backend = "custom"
+                else:
+                    server = run_flower_federation(
+                        clients,
+                        server,
+                        rounds=int(federated_rounds),
+                        client_datasets=client_datasets,
+                        epochs=int(epochs),
+                        batch_size=int(batch_size),
+                        eval_data=(val_data[0], val_data[1]),
+                        aggregation_mode=aggregation_mode,
+                        mu=proximal_mu,
+                    )
+                    server = server
+            if federation_backend == "custom":
+                server = run_multi_client_federation(
+                    clients,
+                    server,
+                    rounds=int(federated_rounds),
+                    client_datasets=client_datasets,
+                    epochs=int(epochs),
+                    batch_size=int(batch_size),
+                    eval_data=(val_data[0], val_data[1]),
+                )
         else:
-            server = run_federation(clients[0], server, rounds=int(federated_rounds))
+            if federation_backend == "flower":
+                if not is_flower_available():
+                    st.warning("Flower is not installed in the active environment. Falling back to the custom federation backend.")
+                    federation_backend = "custom"
+                else:
+                    server = run_flower_federation(
+                        clients,
+                        server,
+                        rounds=int(federated_rounds),
+                        client_datasets={"default": (train_images, train_labels)},
+                        epochs=int(epochs),
+                        batch_size=int(batch_size),
+                        eval_data=(val_data[0], val_data[1]),
+                        aggregation_mode=aggregation_mode,
+                        mu=proximal_mu,
+                    )
+            if federation_backend == "custom":
+                server = run_federation(
+                    clients[0],
+                    server,
+                    rounds=int(federated_rounds),
+                    train_data=(train_images, train_labels),
+                    epochs=int(epochs),
+                    batch_size=int(batch_size),
+                    eval_data=(val_data[0], val_data[1]),
+                )
 
     aggregated_client = clients[0]
     if server.global_weights is not None:
@@ -561,86 +677,90 @@ if run_button:
 
     st.success("Federated aggregation completed")
 
-    col1, col2 = st.columns(2)
-    with col1:
-        st.subheader("Training history")
-        valid_histories = [entry for entry in history_by_client if has_valid_training_history(entry)]
-        if valid_histories:
-            client_labels = [f"Hospital {index}" for index in range(1, len(valid_histories) + 1)]
-            st.caption("Local training curves for each hospital client")
-            client_fig = plot_training_history_by_client(valid_histories, client_labels)
-            st.pyplot(client_fig)
+    st.subheader("MODEL CONFIGURATION")
+    config_cols = st.columns(6)
+    config_values = [
+        ("Model", model_name),
+        ("Backend", federation_backend.upper()),
+        ("Hospital Clients", int(len(clients))),
+        ("Local Epochs", int(epochs)),
+        ("Federated Rounds", int(federated_rounds)),
+        ("Batch Size", int(batch_size)),
+        ("Aggregation", aggregation_mode.upper()),
+    ]
+    for idx, (label, value) in enumerate(config_values):
+        with config_cols[idx]:
+            st.metric(label, str(value))
 
-            if isinstance(history, dict) and history:
-                st.caption("Aggregated training curve")
-                aggregated_fig = plot_training_history(history)
-                st.pyplot(aggregated_fig)
-                chart_df = pd.DataFrame({
-                    key: np.asarray(values, dtype="float32").reshape(-1)
-                    for key, values in history.items()
-                    if isinstance(values, (list, tuple, np.ndarray)) and len(values) > 0
-                })
-                if not chart_df.empty:
-                    st.line_chart(chart_df)
+    st.subheader("LOCAL CLIENT TRAINING")
+    valid_histories = [entry for entry in history_by_client if has_valid_training_history(entry)]
+    if valid_histories:
+        client_labels = [f"Hospital {index}" for index in range(1, len(valid_histories) + 1)]
+        for idx, history in enumerate(valid_histories):
+            st.caption(client_labels[idx])
+            metric_cols = st.columns(4)
+            metric_keys = ["loss", "val_loss", "accuracy", "val_accuracy"]
+            for col_idx, key in enumerate(metric_keys):
+                values = history.get(key, [])
+                value = float(np.asarray(values).reshape(-1)[-1]) if isinstance(values, (list, tuple, np.ndarray)) and np.asarray(values).size > 0 else None
+                with metric_cols[col_idx]:
+                    st.metric(key.replace("_", " ").title(), f"{value:.4f}" if value is not None else "N/A")
+        client_fig = plot_training_history_by_client(valid_histories, client_labels)
+        st.pyplot(client_fig)
+    else:
+        st.info("Local client training history will appear here only after at least one hospital produces a valid local training history.")
 
-            if isinstance(history, dict):
-                metric_items = [
-                    (key, history[key][-1] if history[key] else None)
-                    for key in ["loss", "val_loss", "accuracy", "val_accuracy", "binary_accuracy", "val_binary_accuracy"]
-                    if key in history
-                ]
-                if metric_items:
-                    metric_cols = st.columns(min(4, len(metric_items)))
-                    for col, (key, value) in zip(metric_cols, metric_items):
-                        if value is not None:
-                            col.metric(key, f"{float(value):.4f}")
-        elif history and isinstance(history, dict):
-            fig = plot_training_history(history)
-            st.pyplot(fig)
-            chart_df = pd.DataFrame({
-                key: np.asarray(values, dtype="float32").reshape(-1)
-                for key, values in history.items()
-                if isinstance(values, (list, tuple, np.ndarray)) and len(values) > 0
-            })
-            if not chart_df.empty:
-                st.line_chart(chart_df)
-            if isinstance(history, dict):
-                metric_items = [
-                    (key, history[key][-1] if history[key] else None)
-                    for key in ["loss", "val_loss", "accuracy", "val_accuracy", "binary_accuracy", "val_binary_accuracy"]
-                    if key in history
-                ]
-                if metric_items:
-                    metric_cols = st.columns(min(4, len(metric_items)))
-                    for col, (key, value) in zip(metric_cols, metric_items):
-                        if value is not None:
-                            col.metric(key, f"{float(value):.4f}")
-        else:
-            st.info("Training history will appear here only after at least one hospital produces a valid local training history.")
+    st.subheader("FEDERATED GLOBAL TRAINING")
+    if server.global_round_metrics:
+        round_metrics_df = pd.DataFrame(server.global_round_metrics).sort_values("round").reset_index(drop=True)
+        st.caption("Global metrics are evaluated after each federated round on the updated global model.")
+        st.dataframe(round_metrics_df, use_container_width=True)
 
-    with col2:
-        st.subheader("Model summary")
-        st.write({"Model": model_name, "Accuracy": round(float(accuracy), 4), "Target": round(float(target_accuracy), 4), "Status": accuracy_status, "Classes": list(class_names)})
+        global_chart_cols = st.columns(2)
+        with global_chart_cols[0]:
+            global_accuracy = round_metrics_df[["round", "accuracy"]].set_index("round").rename(columns={"accuracy": "Global Accuracy"})
+            st.line_chart(global_accuracy)
+        with global_chart_cols[1]:
+            global_loss = round_metrics_df[["round", "loss"]].set_index("round").rename(columns={"loss": "Global Loss"})
+            st.line_chart(global_loss)
 
-        pred_labels, true_labels = build_confusion_metrics(aggregated_client, val_data, class_names)
-        metrics = compute_classification_metrics(true_labels, pred_labels, list(class_names))
-        metric_cols = st.columns(3)
-        display_items = [
-            ("Accuracy", metrics.get("accuracy", 0.0)),
-            ("Precision", metrics.get("precision", 0.0)),
-            ("Recall", metrics.get("recall", 0.0)),
-            ("F1-score", metrics.get("f1_score", 0.0)),
-            ("Sensitivity", metrics.get("sensitivity", 0.0)),
-            ("Specificity", metrics.get("specificity", 0.0)),
-            ("Balanced acc", metrics.get("balanced_accuracy", 0.0)),
-        ]
-        for idx, (name, value) in enumerate(display_items):
-            with metric_cols[idx % 3]:
+        if {"val_accuracy", "val_loss"}.intersection(round_metrics_df.columns):
+            val_chart_cols = st.columns(2)
+            with val_chart_cols[0]:
+                val_accuracy = round_metrics_df[["round", "val_accuracy"]].dropna().set_index("round").rename(columns={"val_accuracy": "Global Validation Accuracy"})
+                if not val_accuracy.empty:
+                    st.line_chart(val_accuracy)
+            with val_chart_cols[1]:
+                val_loss = round_metrics_df[["round", "val_loss"]].dropna().set_index("round").rename(columns={"val_loss": "Global Validation Loss"})
+                if not val_loss.empty:
+                    st.line_chart(val_loss)
+    else:
+        st.info("Federated global training history will appear after the first aggregation step.")
+
+    st.subheader("FINAL GLOBAL MODEL PERFORMANCE")
+    pred_labels, true_labels = build_confusion_metrics(aggregated_client, val_data, class_names)
+    metrics = compute_classification_metrics(true_labels, pred_labels, list(class_names))
+    metric_cols = st.columns(3)
+    display_items = [
+        ("Accuracy", metrics.get("accuracy")),
+        ("Precision", metrics.get("precision")),
+        ("Recall", metrics.get("recall")),
+        ("F1-score", metrics.get("f1_score")),
+        ("Sensitivity", metrics.get("sensitivity")),
+        ("Specificity", metrics.get("specificity")),
+    ]
+    for idx, (name, value) in enumerate(display_items):
+        with metric_cols[idx % 3]:
+            if value is None:
+                st.metric(name, "Unavailable")
+            else:
                 st.metric(name, f"{float(value):.4f}")
 
-        confusion_fig = plot_confusion_matrix(true_labels, pred_labels, list(class_names))
-        st.pyplot(confusion_fig)
+    confusion_fig = plot_confusion_matrix(true_labels, pred_labels, list(class_names))
+    st.pyplot(confusion_fig)
 
+    st.subheader("EXPLAINABLE AI (LOCAL XAI)")
+    st.caption("Medical Image → Local Trained CNN → Prediction → Local Grad-CAM → Heatmap/Explanation. Raw images are never transmitted to the federated server.")
     st.subheader("Recent metric runs")
     recent_runs = load_recent_metrics(db_path=metrics_db_path, limit=5)
     if recent_runs:
@@ -659,7 +779,7 @@ if run_button:
     else:
         st.info("No prior run metrics were stored yet.")
 
-    st.subheader("Explainability (Grad-CAM)")
+    st.subheader("Explainability (Grad-CAM, computed locally on the client model)")
     resolved_target_layer = resolve_target_layer_name(target_layer_name)
     sample_indices = select_explainability_samples(images, labels, class_names, max_samples=4)
 

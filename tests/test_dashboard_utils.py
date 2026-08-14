@@ -40,6 +40,21 @@ def test_plot_training_history_by_client_returns_figure():
     assert fig is not None
 
 
+def test_plot_training_history_by_client_skips_missing_metrics_and_keeps_epoch_axis():
+    histories = [
+        {"loss": [1.0, 0.6, 0.4, 0.3, 0.2], "accuracy": [0.5, 0.7, 0.8, 0.9, 0.95]},
+        {"loss": [0.9, 0.8, 0.7], "val_loss": [1.1, 0.9, 0.8]},
+    ]
+
+    fig = plot_training_history_by_client(histories, ["Hospital 1", "Hospital 2"])
+
+    assert fig is not None
+    assert len(fig.axes) == 2
+    assert len(fig.axes[0].lines) >= 2
+    assert len(fig.axes[1].lines) >= 2
+    assert list(fig.axes[0].get_xticks().astype(int))[:1] == [1]
+
+
 def test_plot_confusion_matrix_returns_figure():
     fig = plot_confusion_matrix(
         np.array([0, 1, 1, 0]),

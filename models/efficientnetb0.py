@@ -1,3 +1,5 @@
+import numpy as np
+
 from tensorflow.keras.applications import EfficientNetB0, MobileNetV2, ResNet50, VGG19
 from tensorflow.keras.applications.efficientnet import preprocess_input
 from tensorflow.keras.layers import Dense, GlobalAveragePooling2D
@@ -73,17 +75,28 @@ class FederatedClient:
         train_images = preprocess_input(train_images)
         val_images = preprocess_input(val_images)
 
+        print(
+            f"Client {self.client_id} local training: epochs={int(epochs)}, batch_size={int(batch_size)}, "
+            f"train_shape={train_images.shape}, val_shape={val_images.shape}"
+        )
+
         history = self.model.fit(
             train_images,
             train_labels,
             batch_size=batch_size,
-            epochs=epochs,
+            epochs=int(epochs),
             validation_data=(val_images, val_labels),
             callbacks=callbacks or [],
             verbose=0,
         )
-        print(f"Client {self.client_id} finished training the model")
-        return history.history
+
+        history_dict = history.history if hasattr(history, "history") else {}
+        metrics_summary = {key: len(values) if isinstance(values, (list, tuple)) else 0 for key, values in history_dict.items()}
+        print(
+            f"Client {self.client_id} finished training: "
+            f"metric_keys={list(history_dict.keys())}, metric_lengths={metrics_summary}"
+        )
+        return history_dict
 
     def evaluate_model(self, test_data):
         test_images, test_labels = test_data
