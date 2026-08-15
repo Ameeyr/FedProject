@@ -83,11 +83,19 @@ def run_flower_federation(
             if dataset is None:
                 continue
 
-            if len(dataset) == 2:
-                client_train_images, client_train_labels = dataset
-                train_data = (client_train_images, client_train_labels)
-                _, local_val = server._split_dataset_for_local_validation(client_train_images, client_train_labels, client)
-                val_data = local_val
+            if isinstance(dataset, dict):
+                train_data = dataset.get("train") or dataset.get("train_data")
+                val_data = dataset.get("val") or dataset.get("validation") or dataset.get("val_data")
+                if train_data is None or val_data is None:
+                    raise ValueError(f"Client {client.client_id} dataset is missing train or validation data.")
+            elif len(dataset) == 2:
+                train_data = (dataset[0], dataset[1])
+                val_data = None
+                if client_datasets is not None and isinstance(client_datasets, dict):
+                    val_data = client_datasets.get(client.client_id, {}).get("val")
+                if val_data is None:
+                    _, local_val = server._split_dataset_for_local_validation(dataset[0], dataset[1], client)
+                    val_data = local_val
             else:
                 train_data = (dataset[0], dataset[1])
                 val_data = (dataset[2], dataset[3])
@@ -251,6 +259,7 @@ class FederatedFlowerServer:
         if isinstance(eval_data, dict):
             local_metrics = []
             total_validation_samples = 0
+            hospital_diagnostics = []
             for client in clients:
                 client_id = getattr(client, "client_id", None)
                 if client_id not in eval_data:
@@ -295,6 +304,13 @@ class FederatedFlowerServer:
                     "accuracy": float(accuracy_value),
                     "samples": sample_count,
                 })
+                hospital_diagnostics.append({
+                    "round": self.round,
+                    "hospital": f"Hospital {client_id}",
+                    "loss": float(loss_value),
+                    "accuracy": float(accuracy_value),
+                    "validation_samples": sample_count,
+                })
 
             if not local_metrics:
                 return None
@@ -307,6 +323,7 @@ class FederatedFlowerServer:
                 "accuracy": float(weighted_accuracy),
                 "clients": len(local_metrics),
                 "local_validation_samples": total_validation_samples,
+                "hospital_metrics": hospital_diagnostics,
             }
             self.global_round_metrics.append(metrics)
             return metrics

@@ -1,6 +1,8 @@
+import hashlib
 import tempfile
 from pathlib import Path
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -359,6 +361,8 @@ def build_global_metrics(server_metrics, clients_count=0):
             "global_val_loss": item.get("val_loss", item.get("global_val_loss")),
             "global_val_accuracy": item.get("val_accuracy", item.get("global_val_accuracy")),
             "clients": item.get("clients", clients_count),
+            "validation_samples": item.get("local_validation_samples", item.get("validation_samples")),
+            "hospital_metrics": item.get("hospital_metrics", []),
         })
     return rows
 
@@ -536,6 +540,46 @@ def build_confusion_metrics(client, val_data, class_names):
     return pred_labels, val_labels
 
 
+def validate_train_validation_overlap(train_images, val_images):
+    train_set = set()
+    val_set = set()
+    for image in np.asarray(train_images):
+        image_bytes = np.ascontiguousarray(image).tobytes()
+        image_signature = hashlib.sha256(
+            image_bytes + str(np.asarray(image).shape).encode() + str(np.asarray(image).dtype).encode()
+        ).hexdigest()
+        train_set.add(image_signature)
+    for image in np.asarray(val_images):
+        image_bytes = np.ascontiguousarray(image).tobytes()
+        image_signature = hashlib.sha256(
+            image_bytes + str(np.asarray(image).shape).encode() + str(np.asarray(image).dtype).encode()
+        ).hexdigest()
+        val_set.add(image_signature)
+    overlap = train_set.intersection(val_set)
+    return bool(overlap), overlap
+
+
+def summarize_validation_class_distribution(eval_images, eval_labels):
+    labels = np.asarray(eval_labels).ravel()
+    counts = {int(class_id): int(np.sum(labels == class_id)) for class_id in np.unique(labels)}
+    return counts
+
+
+def build_global_evaluation_diagnostics(client_eval_data):
+    rows = []
+    for client_id, val_data in sorted(client_eval_data.items(), key=lambda item: item[0]):
+        if val_data is None:
+            continue
+        eval_images, eval_labels = val_data
+        counts = summarize_validation_class_distribution(eval_images, eval_labels)
+        rows.append({
+            "Hospital": f"Hospital {client_id}",
+            "Validation Samples": int(len(eval_images)),
+            "Class 0": int(counts.get(0, 0)),
+            "Class 1": int(counts.get(1, 0)),
+        })
+    return rows
+
 st.title("Explainable Federated Learning for Medical Imaging")
 st.caption("Privacy-preserving workflow: local hospital clients train on their own data, a central server only receives model updates, and Grad-CAM is computed locally on the client-side model for explanation.")
 
@@ -643,7 +687,11 @@ if run_button:
         if len(local_images) < 2:
             continue
         local_train_data, local_val_data = split_train_val(local_images, local_labels, seed=7 + client_index)
-        client_datasets[client_index] = local_train_data
+        train_overlap, overlap_hashes = validate_train_validation_overlap(local_train_data[0], local_val_data[0])
+        if train_overlap:
+            st.error("DATA LEAKAGE DETECTED: training and validation images overlap.")
+            st.stop()
+        client_datasets[client_index] = {"train": local_train_data, "val": local_val_data}
         client_eval_data[client_index] = local_val_data
 
     if not hospital_paths and images is not None and labels is not None:
@@ -756,7 +804,8 @@ if run_button:
     history = aggregate_training_history([
         item.get("history", item) for item in history_by_client if isinstance(item, dict)
     ])
-    accuracy = aggregated_client.evaluate_model(val_data)
+    final_global_eval = server.evaluate_global_model(clients, client_eval_data) if client_eval_data else None
+    accuracy = float(final_global_eval["accuracy"]) if isinstance(final_global_eval, dict) and "accuracy" in final_global_eval else 0.0
 
     accuracy_status = "Met" if accuracy >= float(target_accuracy) else "Below target"
     if accuracy >= float(target_accuracy):
@@ -876,7 +925,7 @@ if run_button:
             if column_name not in round_metrics_df.columns:
                 round_metrics_df[column_name] = np.nan
 
-        table_columns = ["Round", "Loss", "Accuracy", "Clients"]
+        table_columns = ["Round", "Loss", "Accuracy", "Clients", "Validation Samples"]
         available_validation = [
             column_name for column_name in validation_columns
             if round_metrics_df[column_name].notna().any()
@@ -892,29 +941,73 @@ if run_button:
         if len(table_df) <= 1:
             st.info("Only one federated round has been completed. Increase the number of federated rounds to view a training curve.")
         else:
-            st.subheader("Global Loss vs Federated Round")
-            loss_chart = table_df[["Round", "Loss"]].dropna().set_index("Round")
-            st.line_chart(loss_chart)
+            round_values = table_df["Round"].astype(int).to_numpy()
 
-            st.subheader("Global Accuracy vs Federated Round")
-            accuracy_chart = table_df[["Round", "Accuracy"]].dropna().set_index("Round")
-            st.line_chart(accuracy_chart)
+            st.subheader("Global Evaluation Loss vs Federated Round")
+            loss_fig, loss_ax = plt.subplots(figsize=(6, 4))
+            loss_ax.plot(round_values, table_df["Loss"].to_numpy(), marker="o")
+            loss_ax.set_xticks(round_values)
+            loss_ax.set_xlabel("Federated Round")
+            loss_ax.set_ylabel("Loss")
+            loss_ax.set_title("Global Evaluation Loss vs Federated Round")
+            scr_loss = loss_fig.tight_layout()
+            st.pyplot(loss_fig)
+
+            st.subheader("Global Evaluation Accuracy vs Federated Round")
+            acc_fig, acc_ax = plt.subplots(figsize=(6, 4))
+            acc_ax.plot(round_values, table_df["Accuracy"].to_numpy(), marker="o")
+            acc_ax.set_xticks(round_values)
+            acc_ax.set_xlabel("Federated Round")
+            acc_ax.set_ylabel("Accuracy")
+            acc_ax.set_title("Global Evaluation Accuracy vs Federated Round")
+            acc_fig.tight_layout()
+            st.pyplot(acc_fig)
 
             if "Validation Accuracy" in table_df.columns and not table_df["Validation Accuracy"].isna().all():
                 st.subheader("Global Validation Accuracy vs Federated Round")
-                val_accuracy_chart = table_df[["Round", "Validation Accuracy"]].dropna().set_index("Round")
-                st.line_chart(val_accuracy_chart)
+                val_acc_fig, val_acc_ax = plt.subplots(figsize=(6, 4))
+                val_acc_ax.plot(round_values, table_df["Validation Accuracy"].to_numpy(), marker="o")
+                val_acc_ax.set_xticks(round_values)
+                val_acc_ax.set_xlabel("Federated Round")
+                val_acc_ax.set_ylabel("Validation Accuracy")
+                val_acc_ax.set_title("Global Validation Accuracy vs Federated Round")
+                val_acc_fig.tight_layout()
+                st.pyplot(val_acc_fig)
 
             if "Validation Loss" in table_df.columns and not table_df["Validation Loss"].isna().all():
                 st.subheader("Global Validation Loss vs Federated Round")
-                val_loss_chart = table_df[["Round", "Validation Loss"]].dropna().set_index("Round")
-                st.line_chart(val_loss_chart)
+                val_loss_fig, val_loss_ax = plt.subplots(figsize=(6, 4))
+                val_loss_ax.plot(round_values, table_df["Validation Loss"].to_numpy(), marker="o")
+                val_loss_ax.set_xticks(round_values)
+                val_loss_ax.set_xlabel("Federated Round")
+                val_loss_ax.set_ylabel("Validation Loss")
+                val_loss_ax.set_title("Global Validation Loss vs Federated Round")
+                val_loss_fig.tight_layout()
+                st.pyplot(val_loss_fig)
     else:
         st.info("Federated global training history will appear after the first aggregation step.")
 
     st.subheader("FINAL GLOBAL MODEL PERFORMANCE")
-    pred_labels, true_labels = build_confusion_metrics(aggregated_client, val_data, class_names)
-    metrics = compute_classification_metrics(true_labels, pred_labels, list(class_names))
+    if len(clients) > 1:
+        combined_true = []
+        combined_pred = []
+        for client_id, val_data in sorted(client_eval_data.items()):
+            if val_data is None:
+                continue
+            client_model = next((client for client in clients if getattr(client, "client_id", None) == client_id), None)
+            if client_model is None:
+                continue
+            client_model.model.set_weights(server.global_weights)
+            local_pred_labels, local_true_labels = build_confusion_metrics(client_model, val_data, class_names)
+            combined_true.extend(np.asarray(local_true_labels).ravel().tolist())
+            combined_pred.extend(np.asarray(local_pred_labels).ravel().tolist())
+        if combined_true and combined_pred:
+            metrics = compute_classification_metrics(np.asarray(combined_true), np.asarray(combined_pred), list(class_names))
+        else:
+            metrics = {"accuracy": None, "precision": None, "recall": None, "f1_score": None, "sensitivity": None, "specificity": None}
+    else:
+        pred_labels, true_labels = build_confusion_metrics(aggregated_client, val_data, class_names)
+        metrics = compute_classification_metrics(true_labels, pred_labels, list(class_names))
     metric_cols = st.columns(3)
     display_items = [
         ("Accuracy", metrics.get("accuracy")),
@@ -931,7 +1024,10 @@ if run_button:
             else:
                 st.metric(name, f"{float(value):.4f}")
 
-    confusion_fig = plot_confusion_matrix(true_labels, pred_labels, list(class_names))
+    if len(clients) > 1 and combined_true and combined_pred:
+        confusion_fig = plot_confusion_matrix(np.asarray(combined_true), np.asarray(combined_pred), list(class_names))
+    else:
+        confusion_fig = plot_confusion_matrix(true_labels, pred_labels, list(class_names))
     st.pyplot(confusion_fig)
 
     st.subheader("EXPLAINABLE AI (LOCAL XAI)")
