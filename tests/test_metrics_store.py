@@ -1,6 +1,7 @@
 import json
 import sqlite3
 
+from app import build_local_metrics, resolve_active_run_id
 from metrics_store import initialize_metrics_db, load_recent_metrics, save_run_metrics
 
 
@@ -64,6 +65,79 @@ def test_save_and_load_training_metrics(tmp_path):
     assert rows[0]["aggregation_mode"] == "fedavg"
     assert json.loads(rows[0]["history_by_client_json"])[0]["loss"] == [1.0, 0.5]
     assert json.loads(rows[0]["aggregated_history_json"])["accuracy"] == [0.25, 0.85]
+
+
+def test_build_local_metrics_preserves_actual_client_and_round_numbers():
+    entries = [
+        {"client_id": 1, "federated_round": 1, "history": {"loss": [1.0, 0.9], "accuracy": [0.5, 0.7], "val_loss": [1.1, 1.0], "val_accuracy": [0.4, 0.6]}},
+        {"client_id": 1, "federated_round": 2, "history": {"loss": [0.8, 0.7], "accuracy": [0.8, 0.9], "val_loss": [0.9, 0.8], "val_accuracy": [0.7, 0.8]}},
+        {"client_id": 2, "federated_round": 1, "history": {"loss": [1.2, 1.1], "accuracy": [0.4, 0.5], "val_loss": [1.3, 1.2], "val_accuracy": [0.3, 0.45]}},
+    ]
+
+    rows = build_local_metrics(entries, {1: "Hospital 1", 2: "Hospital 2"}, federated_round=99)
+
+    assert sorted({row["federated_round"] for row in rows}) == [1, 2]
+    assert {row["client"] for row in rows if row["federated_round"] == 1} == {"Hospital 1", "Hospital 2"}
+    assert all(row["client"] == "Hospital 1" for row in rows if row["federated_round"] == 2)
+
+
+def test_global_metrics_are_stored_one_row_per_federated_round(tmp_path):
+    db_path = tmp_path / "global_round_metrics.db"
+    run_id = save_run_metrics(
+        db_path=db_path,
+        model_name="efficientnetb0",
+        aggregation_mode="fedavg",
+        config={"rounds": 3},
+        global_metrics=[
+            {"round": 1, "global_loss": 0.90, "global_accuracy": 0.70, "global_val_loss": 1.10, "global_val_accuracy": 0.65, "clients": 2},
+            {"round": 2, "global_loss": 0.80, "global_accuracy": 0.75, "global_val_loss": 1.00, "global_val_accuracy": 0.70, "clients": 2},
+            {"round": 3, "global_loss": 0.70, "global_accuracy": 0.82, "global_val_loss": 0.90, "global_val_accuracy": 0.78, "clients": 2},
+        ],
+    )
+
+    connection = sqlite3.connect(db_path)
+    try:
+        rows = connection.execute(
+            "SELECT federated_round, global_loss, global_accuracy FROM global_federated_metrics WHERE run_id = ? ORDER BY federated_round ASC",
+            (run_id,),
+        ).fetchall()
+        assert len(rows) == 3
+        assert [row[0] for row in rows] == [1, 2, 3]
+    finally:
+        connection.close()
+
+
+def test_resolve_active_run_prefers_the_latest_run_id():
+    assert resolve_active_run_id(["run-1", "run-2"], current_run_id="run-1", preferred_run_id="run-2") == "run-2"
+    assert resolve_active_run_id(["run-1", "run-2"], current_run_id=None, preferred_run_id=None) == "run-1"
+
+
+def test_global_metrics_without_validation_data_stay_unset(tmp_path):
+    db_path = tmp_path / "global_metrics_without_validation.db"
+    run_id = save_run_metrics(
+        db_path=db_path,
+        model_name="efficientnetb0",
+        aggregation_mode="fedavg",
+        config={"rounds": 2},
+        global_metrics=[
+            {"round": 1, "global_loss": 0.90, "global_accuracy": 0.70, "clients": 2},
+            {"round": 2, "global_loss": 0.80, "global_accuracy": 0.75, "clients": 2},
+        ],
+    )
+
+    connection = sqlite3.connect(db_path)
+    try:
+        rows = connection.execute(
+            "SELECT federated_round, global_val_loss, global_val_accuracy FROM global_federated_metrics WHERE run_id = ? ORDER BY federated_round ASC",
+            (run_id,),
+        ).fetchall()
+        assert len(rows) == 2
+        assert rows[0][1] is None
+        assert rows[0][2] is None
+        assert rows[1][1] is None
+        assert rows[1][2] is None
+    finally:
+        connection.close()
 
 
 def test_save_run_metrics_stores_local_and_global_metrics_with_run_id(tmp_path):

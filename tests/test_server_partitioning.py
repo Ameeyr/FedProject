@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 import tensorflow as tf
 
+from app import run_multi_client_federation
 from federated.server import (
     FederatedFlowerServer,
     build_flower_strategy,
@@ -122,6 +123,45 @@ def test_global_evaluation_metrics_are_not_fabricated_as_validation_metrics():
     assert "val_accuracy" not in metrics
 
 
+def test_global_evaluation_aggregates_per_client_validation_metrics_only():
+    class DummyModel:
+        def __init__(self, client_id):
+            self.client_id = client_id
+            self.weights = [np.array([float(client_id)], dtype=np.float32)]
+
+        def get_weights(self):
+            return [np.array(weight, copy=True) for weight in self.weights]
+
+        def set_weights(self, weights):
+            self.weights = [np.array(weight, copy=True) for weight in weights]
+
+        def evaluate(self, images, labels, verbose=0):
+            if self.client_id == 1:
+                return 0.50, 0.80
+            return 0.30, 0.90
+
+    class DummyClient:
+        def __init__(self, client_id):
+            self.client_id = client_id
+            self.model = DummyModel(client_id)
+
+    clients = [DummyClient(1), DummyClient(2)]
+    server = FederatedFlowerServer(aggregation_mode="fedavg")
+    server.global_weights = [np.array([1.0], dtype=np.float32)]
+
+    metrics = server.evaluate_global_model(
+        clients,
+        {
+            1: (np.ones((3, 1)), np.array([0, 1, 0])),
+            2: (np.ones((1, 1)), np.array([1])),
+        },
+    )
+
+    assert metrics["loss"] == pytest.approx(0.45)
+    assert metrics["accuracy"] == pytest.approx(0.825)
+    assert metrics["clients"] == 2
+
+
 def test_global_evaluation_failure_is_reported_not_hidden():
     class FailingModel:
         def get_weights(self):
@@ -168,6 +208,114 @@ def test_federated_round_requires_fresh_local_training_per_round():
 
     with pytest.raises(ValueError, match="fresh local training|new local training"):
         server.run_federated_round(clients, round_train_fn=None)
+
+
+def test_federated_training_runs_one_local_training_per_client_per_round():
+    class DummyModel:
+        def __init__(self, base_value):
+            self.base_value = float(base_value)
+            self.weights = [np.array([self.base_value], dtype=np.float32)]
+
+        def get_weights(self):
+            return [np.array(weight, copy=True) for weight in self.weights]
+
+        def set_weights(self, weights):
+            self.weights = [np.array(weight, copy=True) for weight in weights]
+
+        def evaluate(self, images, labels, verbose=0):
+            return float(self.weights[0][0]), float(self.weights[0][0] + 0.1)
+
+    class DummyClient:
+        def __init__(self, client_id):
+            self.client_id = client_id
+            self.model = DummyModel(client_id)
+            self.training_count = 0
+
+    clients = [DummyClient(1), DummyClient(2)]
+    server = FederatedFlowerServer(aggregation_mode="fedavg")
+
+    def train_client_round(client):
+        client.training_count += 1
+        weights = client.model.get_weights()
+        updated = [np.array([weights[0][0] + 1.0], dtype=np.float32)]
+        client.model.set_weights(updated)
+        return updated, {"client_id": client.client_id, "round": server.round + 1, "loss": [1.0], "accuracy": [0.5]}
+
+    server.run_federated_training(clients, rounds=3, round_train_fn=train_client_round, eval_data={1: (np.ones((2, 1)), np.array([0, 1])), 2: (np.ones((2, 1)), np.array([1, 0]))})
+
+    assert server.round == 3
+    assert sum(client.training_count for client in clients) == 6
+    assert len(server.global_round_metrics) == 3
+    assert all(item["round"] == idx for idx, item in enumerate(server.global_round_metrics, start=1))
+
+
+def test_hospital_training_uses_distinct_local_train_and_validation_sets():
+    class DummyModel:
+        def __init__(self, base_value):
+            self.weights = [np.array([base_value], dtype=np.float32)]
+
+        def get_weights(self):
+            return [np.array(weight, copy=True) for weight in self.weights]
+
+        def set_weights(self, weights):
+            self.weights = [np.array(weight, copy=True) for weight in weights]
+
+        def evaluate(self, images, labels, verbose=0):
+            return 0.5, 0.6
+
+    class DummyClient:
+        def __init__(self, client_id):
+            self.client_id = client_id
+            self.model = DummyModel(client_id)
+            self.train_data = None
+            self.val_data = None
+
+        def train_model(self, train_data, val_data, epochs=5, batch_size=32, callbacks=None):
+            self.train_data = train_data
+            self.val_data = val_data
+            return {
+                "loss": [1.0],
+                "accuracy": [0.5],
+                "val_loss": [1.2],
+                "val_accuracy": [0.4],
+            }
+
+    clients = [DummyClient(1), DummyClient(2)]
+    server = FederatedFlowerServer(aggregation_mode="fedavg")
+    server._initialize_global_weights(clients)
+
+    client_datasets = {
+        1: (
+            np.array([0.0, 1.0, 2.0], dtype=np.float32),
+            np.array([0, 1, 0], dtype=np.int32),
+            np.array([3.0], dtype=np.float32),
+            np.array([1], dtype=np.int32),
+        ),
+        2: (
+            np.array([4.0, 5.0, 6.0], dtype=np.float32),
+            np.array([1, 0, 1], dtype=np.int32),
+            np.array([7.0], dtype=np.float32),
+            np.array([0], dtype=np.int32),
+        ),
+    }
+
+    run_multi_client_federation(
+        clients,
+        server,
+        rounds=1,
+        client_datasets=client_datasets,
+        epochs=1,
+        batch_size=1,
+        eval_data={
+            1: (np.array([3.0], dtype=np.float32), np.array([1], dtype=np.int32)),
+            2: (np.array([7.0], dtype=np.float32), np.array([0], dtype=np.int32)),
+        },
+    )
+
+    for client in clients:
+        assert client.train_data[0].tolist() != client.val_data[0].tolist()
+        assert client.train_data[1].tolist() != client.val_data[1].tolist()
+        assert len(client.train_data[0]) > len(client.val_data[0])
 
 
 def test_flower_support_is_optional_and_safe():

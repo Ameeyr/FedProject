@@ -83,11 +83,19 @@ def run_flower_federation(
             if dataset is None:
                 continue
 
-            client_images, client_labels = dataset
+            if len(dataset) == 2:
+                client_train_images, client_train_labels = dataset
+                train_data = (client_train_images, client_train_labels)
+                _, local_val = server._split_dataset_for_local_validation(client_train_images, client_train_labels, client)
+                val_data = local_val
+            else:
+                train_data = (dataset[0], dataset[1])
+                val_data = (dataset[2], dataset[3])
+
             client.model.set_weights(parameters_to_ndarrays(current_parameters))
             client.train_model(
-                (client_images, client_labels),
-                (client_images, client_labels),
+                train_data,
+                val_data,
                 epochs=int(epochs),
                 batch_size=int(batch_size),
                 callbacks=callbacks or [],
@@ -98,7 +106,7 @@ def run_flower_federation(
                     FitRes(
                         Status(Code.OK, "ok"),
                         ndarrays_to_parameters(client.model.get_weights()),
-                        int(len(client_images)),
+                        int(len(train_data[0])),
                         {},
                     ),
                 )
@@ -240,6 +248,69 @@ class FederatedFlowerServer:
         if not clients or eval_data is None:
             return None
 
+        if isinstance(eval_data, dict):
+            local_metrics = []
+            total_validation_samples = 0
+            for client in clients:
+                client_id = getattr(client, "client_id", None)
+                if client_id not in eval_data:
+                    raise ValueError(
+                        f"Missing local validation data for client '{client_id}' during global evaluation. "
+                        "Only numerical metrics should be returned to the server."
+                    )
+
+                client_eval_data = eval_data[client_id]
+                if client_eval_data is None:
+                    raise ValueError(f"Local validation data for client '{client_id}' is empty.")
+
+                eval_images, eval_labels = client_eval_data
+                if eval_images is None or eval_labels is None:
+                    raise ValueError(f"Local validation data for client '{client_id}' is incomplete.")
+
+                sample_count = int(len(eval_images) if hasattr(eval_images, "__len__") else len(eval_labels))
+                if sample_count <= 0:
+                    raise ValueError(f"Local validation data for client '{client_id}' contains no samples.")
+
+                if self.global_weights is not None:
+                    client.model.set_weights(self.global_weights)
+
+                try:
+                    evaluation_result = client.model.evaluate(eval_images, eval_labels, verbose=0)
+                    if isinstance(evaluation_result, dict):
+                        loss_value = float(evaluation_result.get("loss", evaluation_result.get("val_loss", 0.0)))
+                        accuracy_value = float(evaluation_result.get("accuracy", evaluation_result.get("val_accuracy", 0.0)))
+                    elif isinstance(evaluation_result, (list, tuple)) and len(evaluation_result) >= 2:
+                        loss_value = float(evaluation_result[0])
+                        accuracy_value = float(evaluation_result[1])
+                    else:
+                        raise TypeError("Model evaluation did not return loss and accuracy values.")
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"Global evaluation failed during Round {self.round + 1} for client {client_id}: {exc}"
+                    ) from exc
+
+                total_validation_samples += sample_count
+                local_metrics.append({
+                    "loss": float(loss_value),
+                    "accuracy": float(accuracy_value),
+                    "samples": sample_count,
+                })
+
+            if not local_metrics:
+                return None
+
+            weighted_loss = sum(item["loss"] * item["samples"] for item in local_metrics) / total_validation_samples
+            weighted_accuracy = sum(item["accuracy"] * item["samples"] for item in local_metrics) / total_validation_samples
+            metrics = {
+                "round": self.round,
+                "loss": float(weighted_loss),
+                "accuracy": float(weighted_accuracy),
+                "clients": len(local_metrics),
+                "local_validation_samples": total_validation_samples,
+            }
+            self.global_round_metrics.append(metrics)
+            return metrics
+
         eval_images, eval_labels = eval_data
         if eval_images is None or eval_labels is None:
             return None
@@ -285,7 +356,11 @@ class FederatedFlowerServer:
                     client.model.set_weights(self.global_weights)
                     trained_weights, local_history = round_train_fn(client)
                     local_weights.append(trained_weights)
-                    local_histories.append(local_history)
+                    local_histories.append({
+                        "client_id": getattr(client, "client_id", "unknown"),
+                        "federated_round": self.round + 1,
+                        "history": local_history,
+                    })
                 except Exception as exc:
                     raise RuntimeError(
                         f"Federated training failed for Client {getattr(client, 'client_id', 'unknown')} "
@@ -327,6 +402,19 @@ class FederatedFlowerServer:
                     f"Federated training failed during Round {round_index}: {exc}"
                 ) from exc
         return self.global_weights
+
+    @staticmethod
+    def _split_dataset_for_local_validation(images, labels, client=None):
+        if len(images) < 2:
+            return (images, labels), (images, labels)
+
+        seed = 42 + int(getattr(client, "client_id", 0))
+        rng = np.random.default_rng(seed)
+        indices = rng.permutation(len(images))
+        split_index = max(1, int((1 - 0.2) * len(images)))
+        train_idx = indices[:split_index]
+        val_idx = indices[split_index:]
+        return (images[train_idx], labels[train_idx]), (images[val_idx], labels[val_idx])
 
     def apply_global_update(self, client):
         if self.global_weights is None:

@@ -29,6 +29,16 @@ def _to_serializable(value):
     return value
 
 
+def _ensure_metric_rows(metrics):
+    if metrics is None:
+        return []
+    if isinstance(metrics, dict):
+        return [metrics]
+    if isinstance(metrics, (list, tuple)):
+        return [item for item in metrics if isinstance(item, dict)]
+    return []
+
+
 def initialize_metrics_db(db_path=DEFAULT_METRICS_DB):
     connection = _connect(db_path)
     try:
@@ -170,6 +180,9 @@ def save_run_metrics(
             row,
         )
 
+        normalized_local_metrics = _ensure_metric_rows(local_metrics)
+        normalized_global_metrics = _ensure_metric_rows(global_metrics)
+
         connection.executemany(
             """
             INSERT INTO local_client_metrics (run_id, client, federated_round, epoch, loss, accuracy, val_loss, val_accuracy, created_at)
@@ -178,17 +191,16 @@ def save_run_metrics(
             [
                 (
                     run_id,
-                    item.get("client") if isinstance(item, dict) else None,
-                    item.get("federated_round", item.get("round")) if isinstance(item, dict) else None,
-                    item.get("epoch") if isinstance(item, dict) else None,
+                    item.get("client"),
+                    item.get("federated_round", item.get("round")),
+                    item.get("epoch"),
                     item.get("loss"),
                     item.get("accuracy"),
                     item.get("val_loss"),
                     item.get("val_accuracy"),
                     datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 )
-                for item in (local_metrics or [])
-                if isinstance(item, dict)
+                for item in normalized_local_metrics
             ],
         )
 
@@ -200,7 +212,7 @@ def save_run_metrics(
             [
                 (
                     run_id,
-                    item.get("federated_round", item.get("round")) if isinstance(item, dict) else None,
+                    item.get("federated_round", item.get("round")),
                     item.get("global_loss", item.get("loss")),
                     item.get("global_accuracy", item.get("accuracy")),
                     item.get("global_val_loss", item.get("val_loss")),
@@ -208,8 +220,7 @@ def save_run_metrics(
                     item.get("clients"),
                     datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 )
-                for item in (global_metrics or [])
-                if isinstance(item, dict)
+                for item in normalized_global_metrics
             ],
         )
 
