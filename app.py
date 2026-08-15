@@ -416,21 +416,26 @@ def run_federation(client, server, rounds=1, train_data=None, epochs=5, batch_si
     if train_data is None:
         raise ValueError("train_data is required for the correct federated workflow: each round must train the client from the latest global model.")
 
+    if eval_data is not None and not isinstance(eval_data, dict):
+        validation_data = eval_data
+    else:
+        validation_data = eval_data.get(1, eval_data) if isinstance(eval_data, dict) else None
+
     for round_index in range(1, int(rounds) + 1):
         client.model.set_weights(server.global_weights)
         train_images, train_labels = train_data
-        train_split, val_split = split_train_val(train_images, train_labels, seed=7 + round_index)
-        train_images_split, train_labels_split = train_split
-        val_images_split, val_labels_split = val_split
+        if validation_data is None:
+            raise ValueError("A pre-split validation set is required for the correct federated workflow; do not split training data again inside the training loop.")
+        val_images, val_labels = validation_data
         history = client.train_model(
-            (train_images_split, train_labels_split),
-            (val_images_split, val_labels_split),
+            (train_images, train_labels),
+            (val_images, val_labels),
             epochs=int(epochs),
             batch_size=int(batch_size),
             callbacks=callbacks or [],
         )
         client_weights = client.model.get_weights()
-        aggregated_weights = server.aggregate_with_fedprox([client_weights], server.global_weights)
+        aggregated_weights = server.aggregate_with_fedprox([client_weights], server.global_weights, sample_counts=[len(train_images)])
         server.update_global_model(aggregated_weights)
         client.model.set_weights(server.global_weights)
         if eval_data is not None:
@@ -454,16 +459,23 @@ def run_multi_client_federation(clients, server, rounds=1, client_datasets=None,
             dataset = client_datasets.get("default")
         if dataset is None:
             current_weights = client.model.get_weights()
-            return current_weights, {"round": server.round + 1, "trained": False, "client_id": client.client_id}
+            return current_weights, {"round": server.round + 1, "trained": False, "client_id": client.client_id}, 0
 
-        if len(dataset) == 2:
-            client_train_images, client_train_labels = dataset
-            client_val_images, client_val_labels = split_train_val(client_train_images, client_train_labels, seed=7 + int(client.client_id))
-            train_data = (client_train_images, client_train_labels)
-            val_data = (client_val_images, client_val_labels)
-        else:
+        if isinstance(dataset, dict):
+            train_data = dataset.get("train") or dataset.get("train_data")
+            val_data = dataset.get("val") or dataset.get("validation") or dataset.get("val_data")
+            if train_data is None or val_data is None:
+                raise ValueError(f"Client {client.client_id} is missing a pre-split train/validation pair. Do not split again inside the federated loop.")
+        elif len(dataset) == 4:
             train_data = (dataset[0], dataset[1])
             val_data = (dataset[2], dataset[3])
+        elif len(dataset) == 2:
+            raise ValueError(
+                f"Client {client.client_id} dataset is only a single split. "
+                "Provide train_data and validation_data before federation; do not split again inside the server."
+            )
+        else:
+            raise ValueError(f"Client {client.client_id} dataset is in an unsupported format: expected train/val pair or 4-tuple.")
 
         client.model.set_weights(server.global_weights)
         history = client.train_model(
@@ -473,7 +485,8 @@ def run_multi_client_federation(clients, server, rounds=1, client_datasets=None,
             batch_size=int(batch_size),
             callbacks=callbacks or [],
         )
-        return client.model.get_weights(), history
+        sample_count = int(len(train_data[0]))
+        return client.model.get_weights(), history, sample_count
 
     server.run_federated_training(clients, rounds=int(rounds), round_train_fn=train_client_round, eval_data=eval_data)
     return server
@@ -681,6 +694,7 @@ if run_button:
 
     client_datasets = {}
     client_eval_data = {}
+    hospital_debug_summary = []
     for client_index, hospital_dataset in enumerate(selected_datasets, start=1):
         local_images = hospital_dataset["images"]
         local_labels = hospital_dataset["labels"]
@@ -689,10 +703,26 @@ if run_button:
         local_train_data, local_val_data = split_train_val(local_images, local_labels, seed=7 + client_index)
         train_overlap, overlap_hashes = validate_train_validation_overlap(local_train_data[0], local_val_data[0])
         if train_overlap:
-            st.error("DATA LEAKAGE DETECTED: training and validation images overlap.")
+            st.error(f"DATA LEAKAGE DETECTED for Hospital {client_index}: {len(overlap_hashes)} duplicated image(s) across train and validation.")
             st.stop()
+        train_counts = summarize_validation_class_distribution(local_train_data[0], local_train_data[1])
+        val_counts = summarize_validation_class_distribution(local_val_data[0], local_val_data[1])
+        if len(np.unique(local_val_data[1])) <= 1:
+            st.warning(f"Validation set for Hospital {client_index} contains only one class; accuracy may be misleading.")
+        hospital_debug_summary.append({
+            "Hospital": f"Hospital {client_index}",
+            "Train Samples": int(len(local_train_data[0])),
+            "Validation Samples": int(len(local_val_data[0])),
+            "Train Class 0": int(train_counts.get(0, 0)),
+            "Train Class 1": int(train_counts.get(1, 0)),
+            "Validation Class 0": int(val_counts.get(0, 0)),
+            "Validation Class 1": int(val_counts.get(1, 0)),
+        })
         client_datasets[client_index] = {"train": local_train_data, "val": local_val_data}
         client_eval_data[client_index] = local_val_data
+
+    if hospital_debug_summary:
+        st.dataframe(pd.DataFrame(hospital_debug_summary), use_container_width=True)
 
     if not hospital_paths and images is not None and labels is not None:
         if len(images) < 2:

@@ -226,30 +226,35 @@ class FederatedFlowerServer:
         self.history.append({"round": self.round, "weights_shape": [np.shape(weight) for weight in self.global_weights], "mode": self.aggregation_mode})
         return self.global_weights
 
-    def aggregate_client_updates(self, client_weights_list):
+    def aggregate_client_updates(self, client_weights_list, sample_counts=None):
         if not client_weights_list:
             raise ValueError("At least one client weight set is required")
 
+        if sample_counts is None:
+            sample_counts = [1] * len(client_weights_list)
+        sample_counts = [max(1, int(count)) for count in sample_counts]
+        total_samples = float(sum(sample_counts))
+        weights = [count / total_samples for count in sample_counts]
+
         averaged = []
         for idx in range(len(client_weights_list[0])):
-            stacked = np.stack([np.array(weights[idx], copy=True) for weights in client_weights_list], axis=0)
-            averaged.append(np.mean(stacked, axis=0))
+            stacked = np.stack([np.array(weights_list[idx], copy=True) for weights_list in client_weights_list], axis=0)
+            averaged.append(np.tensordot(np.asarray(weights, dtype=np.float64), stacked, axes=([0], [0])))
         return averaged
 
-    def aggregate_with_fedprox(self, client_weights_list, global_weights):
+    def aggregate_with_fedprox(self, client_weights_list, global_weights, sample_counts=None):
         self._validate_aggregation_mode()
         if self.aggregation_mode != "fedprox":
-            return self.aggregate_client_updates(client_weights_list)
+            return self.aggregate_client_updates(client_weights_list, sample_counts=sample_counts)
 
         if global_weights is None:
-            return self.aggregate_client_updates(client_weights_list)
+            return self.aggregate_client_updates(client_weights_list, sample_counts=sample_counts)
 
+        weighted_averaged = self.aggregate_client_updates(client_weights_list, sample_counts=sample_counts)
         proximal_updates = []
         for idx in range(len(client_weights_list[0])):
-            stacked = np.stack([np.array(weights[idx], copy=True) for weights in client_weights_list], axis=0)
-            averaged = np.mean(stacked, axis=0)
             global_arr = np.array(global_weights[idx], copy=True)
-            proximal_updates.append(averaged + self.mu * (averaged - global_arr))
+            proximal_updates.append(weighted_averaged[idx] + self.mu * (weighted_averaged[idx] - global_arr))
         return proximal_updates
 
     def evaluate_global_model(self, clients, eval_data):
@@ -371,12 +376,20 @@ class FederatedFlowerServer:
             for client in clients:
                 try:
                     client.model.set_weights(self.global_weights)
-                    trained_weights, local_history = round_train_fn(client)
+                    round_result = round_train_fn(client)
+                    if len(round_result) == 3:
+                        trained_weights, local_history, sample_count = round_result
+                    elif len(round_result) == 2:
+                        trained_weights, local_history = round_result
+                        sample_count = 1
+                    else:
+                        raise ValueError("round_train_fn must return (weights, history) or (weights, history, sample_count)")
                     local_weights.append(trained_weights)
                     local_histories.append({
                         "client_id": getattr(client, "client_id", "unknown"),
                         "federated_round": self.round + 1,
                         "history": local_history,
+                        "sample_count": int(sample_count),
                     })
                 except Exception as exc:
                     raise RuntimeError(
@@ -384,7 +397,8 @@ class FederatedFlowerServer:
                         f"during Round {self.round + 1}: local training/update operation failed: {exc}"
                     ) from exc
 
-            aggregated_weights = self.aggregate_with_fedprox(local_weights, self.global_weights)
+            sample_counts = [int(item.get("sample_count", 1)) for item in local_histories]
+            aggregated_weights = self.aggregate_with_fedprox(local_weights, self.global_weights, sample_counts=sample_counts)
             self.update_global_model(aggregated_weights)
             self.client_histories.append({
                 "round": self.round,

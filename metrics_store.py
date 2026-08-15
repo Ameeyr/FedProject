@@ -112,9 +112,13 @@ def initialize_metrics_db(db_path=DEFAULT_METRICS_DB):
                 global_val_loss REAL,\
                 global_val_accuracy REAL,\
                 clients INTEGER,\
+                validation_samples INTEGER,\
                 created_at TEXT NOT NULL\
             )"
         )
+        global_columns = [row[1] for row in connection.execute("PRAGMA table_info(global_federated_metrics)").fetchall()]
+        if "validation_samples" not in global_columns:
+            connection.execute("ALTER TABLE global_federated_metrics ADD COLUMN validation_samples INTEGER")
         connection.commit()
     finally:
         connection.close()
@@ -206,8 +210,17 @@ def save_run_metrics(
 
         connection.executemany(
             """
-            INSERT INTO global_federated_metrics (run_id, federated_round, global_loss, global_accuracy, global_val_loss, global_val_accuracy, clients, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO global_federated_metrics (
+                run_id,
+                federated_round,
+                global_loss,
+                global_accuracy,
+                global_val_loss,
+                global_val_accuracy,
+                clients,
+                validation_samples,
+                created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -218,6 +231,7 @@ def save_run_metrics(
                     item.get("global_val_loss", item.get("val_loss")),
                     item.get("global_val_accuracy", item.get("val_accuracy")),
                     item.get("clients"),
+                    item.get("validation_samples", item.get("local_validation_samples")),
                     datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 )
                 for item in normalized_global_metrics
