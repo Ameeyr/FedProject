@@ -14,7 +14,15 @@ from dashboard_utils import (
     plot_training_history,
     plot_training_history_by_client,
 )
-from metrics_store import DEFAULT_METRICS_DB, load_recent_metrics, save_run_metrics
+from metrics_store import (
+    DEFAULT_METRICS_DB,
+    list_run_ids,
+    load_recent_metrics,
+    load_run_global_metrics,
+    load_run_local_metrics,
+    load_run_metrics_by_id,
+    save_run_metrics,
+)
 from models.efficientnetb0 import FederatedClient, SUPPORTED_MODELS
 from preprocessing.preprocess_images import ImagePreprocessor
 from federated.server import (
@@ -277,6 +285,65 @@ def has_valid_training_history(history):
     return False
 
 
+def _metric_last_value(history, key):
+    if not isinstance(history, dict):
+        return None
+    values = history.get(key, [])
+    arr = np.asarray(values, dtype="float32").reshape(-1)
+    finite_values = arr[np.isfinite(arr)]
+    if finite_values.size == 0:
+        return None
+    return float(finite_values[-1])
+
+
+def build_local_metrics(history_by_client, client_labels=None, federated_round=1):
+    rows = []
+    for client_index, history in enumerate(history_by_client):
+        if not isinstance(history, dict):
+            continue
+        client_name = client_labels[client_index] if client_labels and client_index < len(client_labels) else f"Hospital {client_index + 1}"
+        epoch_count = max(
+            [
+                len(np.asarray(history.get(key, []), dtype="float32").reshape(-1))
+                for key in ("loss", "accuracy", "val_loss", "val_accuracy")
+                if key in history
+            ]
+            or [0]
+        )
+        for epoch in range(epoch_count):
+            row = {
+                "client": client_name,
+                "federated_round": int(federated_round),
+                "epoch": int(epoch + 1),
+                "loss": _metric_last_value({key: np.asarray(history.get(key, []), dtype="float32").reshape(-1)[epoch:epoch + 1] for key in history if key in {"loss", "accuracy", "val_loss", "val_accuracy"}} , "loss"),
+                "accuracy": _metric_last_value({key: np.asarray(history.get(key, []), dtype="float32").reshape(-1)[epoch:epoch + 1] for key in history if key in {"loss", "accuracy", "val_loss", "val_accuracy"}} , "accuracy"),
+                "val_loss": _metric_last_value({key: np.asarray(history.get(key, []), dtype="float32").reshape(-1)[epoch:epoch + 1] for key in history if key in {"loss", "accuracy", "val_loss", "val_accuracy"}} , "val_loss"),
+                "val_accuracy": _metric_last_value({key: np.asarray(history.get(key, []), dtype="float32").reshape(-1)[epoch:epoch + 1] for key in history if key in {"loss", "accuracy", "val_loss", "val_accuracy"}} , "val_accuracy"),
+            }
+            rows.append(row)
+    return rows
+
+
+def build_global_metrics(server_metrics, clients_count=0):
+    rows = []
+    for item in server_metrics or []:
+        if not isinstance(item, dict):
+            continue
+        round_number = item.get("federated_round", item.get("round"))
+        if round_number is None:
+            continue
+        rows.append({
+            "federated_round": int(round_number),
+            "round": int(round_number),
+            "global_loss": item.get("loss", item.get("global_loss")),
+            "global_accuracy": item.get("accuracy", item.get("global_accuracy")),
+            "global_val_loss": item.get("val_loss", item.get("global_val_loss")),
+            "global_val_accuracy": item.get("val_accuracy", item.get("global_val_accuracy")),
+            "clients": item.get("clients", clients_count),
+        })
+    return rows
+
+
 def split_train_val(images, labels, val_fraction=0.2, seed=42):
     if len(images) < 2:
         return (images, labels), (images[:1], labels[:1])
@@ -536,54 +603,36 @@ if run_button:
 
     train_data, val_data = split_train_val(images, labels, seed=7)
     train_images, train_labels = train_data
-    with st.spinner("Training hospital clients locally..."):
-        clients = []
-        history_by_client = []
-        if hospital_paths:
-            selected_datasets, client_count = resolve_hospital_selection(hospital_datasets, hospital_paths, int(hospital_count))
-        else:
-            selected_datasets = [{"images": images, "labels": labels, "class_names": class_names}]
-            client_count = 1
 
-        for client_index, hospital_dataset in enumerate(selected_datasets, start=1):
-            client_images = hospital_dataset["images"]
-            client_labels = hospital_dataset["labels"]
-            if len(client_images) < 2:
-                st.warning(f"Hospital {client_index} skipped: fewer than 2 valid images after preprocessing.")
-                continue
-            client = FederatedClient(
-                client_id=client_index,
-                server_address="local",
-                model_name=model_name,
-                num_classes=len(class_names),
-            )
-            try:
-                client_history = client.train_model(
-                    (client_images, client_labels),
-                    val_data,
-                    epochs=int(epochs),
-                    batch_size=batch_size,
-                    callbacks=[],
-                )
-            except Exception as exc:
-                st.warning(f"Hospital {client_index} failed to train: {exc}")
-                continue
+    if hospital_paths:
+        selected_datasets, client_count = resolve_hospital_selection(hospital_datasets, hospital_paths, int(hospital_count))
+    else:
+        selected_datasets = [{"images": images, "labels": labels, "class_names": class_names}]
+        client_count = 1
 
-            if not has_valid_training_history(client_history):
-                st.warning(f"Hospital {client_index} produced no valid training history. Check image labeling and preprocessing.")
-                continue
+    clients = []
+    for client_index, hospital_dataset in enumerate(selected_datasets, start=1):
+        client_images = hospital_dataset["images"]
+        client_labels = hospital_dataset["labels"]
+        if len(client_images) < 2:
+            st.warning(f"Hospital {client_index} skipped: fewer than 2 valid images after preprocessing.")
+            continue
+        client = FederatedClient(
+            client_id=client_index,
+            server_address="local",
+            model_name=model_name,
+            num_classes=len(class_names),
+        )
+        clients.append(client)
 
-            history_by_client.append(client_history)
-            clients.append(client)
-
-    if not history_by_client or not clients:
-        st.error("No hospital produced valid training history. Check that each hospital folder has labeled class directories and enough images.")
+    if not clients:
+        st.error("No valid hospital clients were created. Check that each hospital dataset contains enough labeled images.")
         st.stop()
 
-    st.success("Local hospital training complete")
+    st.success("Initialized global model and hospital clients for federated training")
 
     server = FederatedFlowerServer(model_name=model_name, aggregation_mode=aggregation_mode, mu=proximal_mu)
-    with st.spinner("Running federated rounds: local training on each hospital, then server aggregation..."):
+    with st.spinner("Running federated rounds: each hospital receives the global model, trains locally for the configured epochs, and sends updates for aggregation..."):
         if len(class_names) >= 2 and len(clients) >= 2:
             client_datasets = {
                 client.client_id: (hospital_dataset["images"], hospital_dataset["labels"])
@@ -647,6 +696,17 @@ if run_button:
     aggregated_client = clients[0]
     if server.global_weights is not None:
         aggregated_client.model.set_weights(server.global_weights)
+
+    history_by_client = []
+    for round_state in getattr(server, "client_histories", []):
+        local_histories = round_state.get("local_histories", []) if isinstance(round_state, dict) else []
+        for local_history in local_histories:
+            if isinstance(local_history, dict) and has_valid_training_history(local_history):
+                history_by_client.append(local_history)
+
+    if not history_by_client:
+        history_by_client = []
+
     history = aggregate_training_history(history_by_client)
     accuracy = aggregated_client.evaluate_model(val_data)
 
@@ -657,6 +717,8 @@ if run_button:
         st.warning(f"Model accuracy is below the target: {accuracy:.4f} < {target_accuracy:.2f}. Increase epochs or improve preprocessing.")
 
     metrics_db_path = Path(result_dir).expanduser() / "training_metrics.db"
+    local_metrics = build_local_metrics(history_by_client, [f"Hospital {index}" for index in range(1, len(history_by_client) + 1)], federated_round=int(federated_rounds))
+    global_metrics = build_global_metrics(server.global_round_metrics, clients_count=int(len(clients)))
     run_id = save_run_metrics(
         db_path=metrics_db_path,
         model_name=model_name,
@@ -670,6 +732,8 @@ if run_button:
         },
         history_by_client=history_by_client,
         aggregated_history=history,
+        local_metrics=local_metrics,
+        global_metrics=global_metrics,
         accuracy=float(accuracy),
         val_accuracy=float(accuracy),
     )
@@ -678,7 +742,6 @@ if run_button:
     st.success("Federated aggregation completed")
 
     st.subheader("MODEL CONFIGURATION")
-    config_cols = st.columns(6)
     config_values = [
         ("Model", model_name),
         ("Backend", federation_backend.upper()),
@@ -688,11 +751,12 @@ if run_button:
         ("Batch Size", int(batch_size)),
         ("Aggregation", aggregation_mode.upper()),
     ]
+    config_cols = st.columns(len(config_values))
     for idx, (label, value) in enumerate(config_values):
         with config_cols[idx]:
             st.metric(label, str(value))
 
-    st.subheader("LOCAL CLIENT TRAINING")
+    st.markdown("## SECTION A: LOCAL CLIENT TRAINING")
     valid_histories = [entry for entry in history_by_client if has_valid_training_history(entry)]
     if valid_histories:
         client_labels = [f"Hospital {index}" for index in range(1, len(valid_histories) + 1)]
@@ -703,37 +767,72 @@ if run_button:
             for col_idx, key in enumerate(metric_keys):
                 values = history.get(key, [])
                 value = float(np.asarray(values).reshape(-1)[-1]) if isinstance(values, (list, tuple, np.ndarray)) and np.asarray(values).size > 0 else None
+                label = {
+                    "loss": "Training Loss",
+                    "val_loss": "Validation Loss",
+                    "accuracy": "Training Accuracy",
+                    "val_accuracy": "Validation Accuracy",
+                }.get(key, key.replace("_", " ").title())
                 with metric_cols[col_idx]:
-                    st.metric(key.replace("_", " ").title(), f"{value:.4f}" if value is not None else "N/A")
+                    st.metric(label, f"{value:.4f}" if value is not None else "N/A")
         client_fig = plot_training_history_by_client(valid_histories, client_labels)
         st.pyplot(client_fig)
     else:
         st.info("Local client training history will appear here only after at least one hospital produces a valid local training history.")
 
-    st.subheader("FEDERATED GLOBAL TRAINING")
+    st.markdown("## SECTION B: FEDERATED GLOBAL TRAINING")
     if server.global_round_metrics:
-        round_metrics_df = pd.DataFrame(server.global_round_metrics).sort_values("round").reset_index(drop=True)
-        st.caption("Global metrics are evaluated after each federated round on the updated global model.")
-        st.dataframe(round_metrics_df, use_container_width=True)
+        round_metrics_df = pd.DataFrame(server.global_round_metrics)
+        if "round" not in round_metrics_df.columns and "federated_round" in round_metrics_df.columns:
+            round_metrics_df = round_metrics_df.rename(columns={"federated_round": "round"})
+        if "round" in round_metrics_df.columns:
+            round_metrics_df = round_metrics_df.sort_values("round").reset_index(drop=True)
+        round_metrics_df = round_metrics_df.copy()
 
-        global_chart_cols = st.columns(2)
-        with global_chart_cols[0]:
-            global_accuracy = round_metrics_df[["round", "accuracy"]].set_index("round").rename(columns={"accuracy": "Global Accuracy"})
-            st.line_chart(global_accuracy)
-        with global_chart_cols[1]:
-            global_loss = round_metrics_df[["round", "loss"]].set_index("round").rename(columns={"loss": "Global Loss"})
-            st.line_chart(global_loss)
+        for existing, target in {
+            "round": "Round",
+            "loss": "Global Evaluation Loss",
+            "accuracy": "Global Evaluation Accuracy",
+            "val_loss": "Global Validation Loss",
+            "val_accuracy": "Global Validation Accuracy",
+            "clients": "Clients",
+        }.items():
+            if existing in round_metrics_df.columns:
+                round_metrics_df = round_metrics_df.rename(columns={existing: target})
 
-        if {"val_accuracy", "val_loss"}.intersection(round_metrics_df.columns):
-            val_chart_cols = st.columns(2)
-            with val_chart_cols[0]:
-                val_accuracy = round_metrics_df[["round", "val_accuracy"]].dropna().set_index("round").rename(columns={"val_accuracy": "Global Validation Accuracy"})
-                if not val_accuracy.empty:
-                    st.line_chart(val_accuracy)
-            with val_chart_cols[1]:
-                val_loss = round_metrics_df[["round", "val_loss"]].dropna().set_index("round").rename(columns={"val_loss": "Global Validation Loss"})
-                if not val_loss.empty:
-                    st.line_chart(val_loss)
+        if "Round" not in round_metrics_df.columns:
+            round_metrics_df["Round"] = np.arange(1, len(round_metrics_df) + 1)
+
+        table_columns = ["Round", "Global Evaluation Loss", "Global Evaluation Accuracy", "Clients"]
+        for column_name in ["Global Validation Loss", "Global Validation Accuracy"]:
+            if column_name not in round_metrics_df.columns:
+                round_metrics_df[column_name] = np.nan
+            if round_metrics_df[column_name].notna().any():
+                table_columns.append(column_name)
+
+        table_df = round_metrics_df[table_columns].copy()
+        st.dataframe(table_df, use_container_width=True)
+
+        if len(table_df) <= 1:
+            st.info("Only one federated round has been completed. Increase the number of federated rounds to view a training curve.")
+        else:
+            st.subheader("1. Global Evaluation Accuracy vs Federated Round")
+            accuracy_chart = table_df[["Round", "Global Evaluation Accuracy"]].dropna().set_index("Round")
+            st.line_chart(accuracy_chart)
+
+            st.subheader("2. Global Evaluation Loss vs Federated Round")
+            loss_chart = table_df[["Round", "Global Evaluation Loss"]].dropna().set_index("Round")
+            st.line_chart(loss_chart)
+
+            if "Global Validation Accuracy" in table_df.columns and not table_df["Global Validation Accuracy"].isna().all():
+                st.subheader("3. Global Validation Accuracy vs Federated Round")
+                val_accuracy_chart = table_df[["Round", "Global Validation Accuracy"]].dropna().set_index("Round")
+                st.line_chart(val_accuracy_chart)
+
+            if "Global Validation Loss" in table_df.columns and not table_df["Global Validation Loss"].isna().all():
+                st.subheader("4. Global Validation Loss vs Federated Round")
+                val_loss_chart = table_df[["Round", "Global Validation Loss"]].dropna().set_index("Round")
+                st.line_chart(val_loss_chart)
     else:
         st.info("Federated global training history will appear after the first aggregation step.")
 
@@ -762,13 +861,49 @@ if run_button:
     st.subheader("EXPLAINABLE AI (LOCAL XAI)")
     st.caption("Medical Image → Local Trained CNN → Prediction → Local Grad-CAM → Heatmap/Explanation. Raw images are never transmitted to the federated server.")
     st.subheader("Recent metric runs")
+    available_run_ids = list_run_ids(db_path=metrics_db_path, limit=20)
+    current_run_id = st.session_state.get("current_run_id") or (available_run_ids[0] if available_run_ids else None)
+    if available_run_ids:
+        selected_run_id = st.selectbox(
+            "Metric run selector",
+            options=available_run_ids,
+            index=available_run_ids.index(current_run_id) if current_run_id in available_run_ids else 0,
+            help="Only metrics for the selected run are displayed. This prevents mixing different training runs.",
+        )
+        st.session_state["current_run_id"] = selected_run_id
+    else:
+        selected_run_id = current_run_id
+
+    selected_run_metrics = load_run_metrics_by_id(db_path=metrics_db_path, run_id=selected_run_id)
+    selected_local_metrics = load_run_local_metrics(db_path=metrics_db_path, run_id=selected_run_id)
+    selected_global_metrics = load_run_global_metrics(db_path=metrics_db_path, run_id=selected_run_id)
+
+    if selected_run_metrics:
+        st.caption(f"Active run: {selected_run_id}")
+        st.code(
+            f"run_id={selected_run_id}\nmodel={selected_run_metrics.get('model_name')}\naggregation={selected_run_metrics.get('aggregation_mode')}\naccuracy={selected_run_metrics.get('accuracy')}\nval_accuracy={selected_run_metrics.get('val_accuracy')}",
+            language="text",
+        )
+
+    if selected_local_metrics:
+        local_run_df = pd.DataFrame(selected_local_metrics)
+        st.dataframe(local_run_df, use_container_width=True)
+    else:
+        st.info("No local client metrics are stored for the selected run.")
+
+    if selected_global_metrics:
+        global_run_df = pd.DataFrame(selected_global_metrics)
+        st.dataframe(global_run_df, use_container_width=True)
+    else:
+        st.info("No global federated metrics are stored for the selected run.")
+
     recent_runs = load_recent_metrics(db_path=metrics_db_path, limit=5)
     if recent_runs:
         recent_rows = []
         for row in recent_runs:
             recent_rows.append(
                 {
-                    "Run": row["id"],
+                    "Run": row.get("run_id") or row["id"],
                     "Time": row["created_at"],
                     "Model": row["model_name"],
                     "Aggregation": row["aggregation_mode"],

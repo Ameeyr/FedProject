@@ -75,7 +75,7 @@ def test_save_run_metrics_stores_local_and_global_metrics_with_run_id(tmp_path):
         aggregation_mode="fedavg",
         config={"rounds": 1},
         local_metrics=[
-            {"client": "Hospital 1", "epoch": 1, "loss": 1.2, "accuracy": 0.45, "val_loss": 1.3, "val_accuracy": 0.40},
+            {"client": "Hospital 1", "federated_round": 1, "epoch": 1, "loss": 1.2, "accuracy": 0.45, "val_loss": 1.3, "val_accuracy": 0.40},
         ],
         global_metrics=[
             {"round": 1, "global_loss": 1.2, "global_accuracy": 0.45, "global_val_loss": 1.3, "global_val_accuracy": 0.40, "clients": 1},
@@ -88,8 +88,8 @@ def test_save_run_metrics_stores_local_and_global_metrics_with_run_id(tmp_path):
         aggregation_mode="fedavg",
         config={"rounds": 2},
         local_metrics=[
-            {"client": "Hospital 1", "epoch": 2, "loss": 0.8, "accuracy": 0.75, "val_loss": 0.9, "val_accuracy": 0.70},
-            {"client": "Hospital 2", "epoch": 2, "loss": 0.7, "accuracy": 0.80, "val_loss": 0.8, "val_accuracy": 0.75},
+            {"client": "Hospital 1", "federated_round": 2, "epoch": 2, "loss": 0.8, "accuracy": 0.75, "val_loss": 0.9, "val_accuracy": 0.70},
+            {"client": "Hospital 2", "federated_round": 2, "epoch": 2, "loss": 0.7, "accuracy": 0.80, "val_loss": 0.8, "val_accuracy": 0.75},
         ],
         global_metrics=[
             {"round": 1, "global_loss": 1.0, "global_accuracy": 0.60, "global_val_loss": 1.1, "global_val_accuracy": 0.55, "clients": 2},
@@ -97,7 +97,35 @@ def test_save_run_metrics_stores_local_and_global_metrics_with_run_id(tmp_path):
         ],
     )
 
+    assert isinstance(first_run, str) and first_run.startswith("run-")
+    assert isinstance(second_run, str) and second_run.startswith("run-")
+    assert first_run != second_run
+
     latest = load_recent_metrics(db_path=db_path, limit=1)[0]
-    assert second_run == latest["id"]
+    assert latest["run_id"] == second_run
     assert latest["config_json"]
-    assert latest["id"] == second_run
+
+    connection = sqlite3.connect(db_path)
+    try:
+        local_columns = [row[1] for row in connection.execute("PRAGMA table_info(local_client_metrics)").fetchall()]
+        global_columns = [row[1] for row in connection.execute("PRAGMA table_info(global_federated_metrics)").fetchall()]
+        assert "federated_round" in local_columns
+        assert "federated_round" in global_columns
+        local_rows = connection.execute(
+            "SELECT COUNT(*) FROM local_client_metrics WHERE run_id = ?",
+            (second_run,),
+        ).fetchone()[0]
+        global_rows = connection.execute(
+            "SELECT COUNT(*) FROM global_federated_metrics WHERE run_id = ?",
+            (second_run,),
+        ).fetchone()[0]
+        assert local_rows == 2
+        assert global_rows == 2
+
+        first_run_local = connection.execute(
+            "SELECT COUNT(*) FROM local_client_metrics WHERE run_id = ?",
+            (first_run,),
+        ).fetchone()[0]
+        assert first_run_local == 1
+    finally:
+        connection.close()

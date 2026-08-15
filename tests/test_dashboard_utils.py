@@ -18,6 +18,21 @@ def test_plot_training_history_returns_figure():
     assert fig is not None
 
 
+def test_plot_training_history_uses_round_axis_for_global_history():
+    history = {
+        "round": [1, 2, 3],
+        "global_loss": [0.8, 0.6, 0.5],
+        "global_accuracy": [0.70, 0.80, 0.90],
+    }
+
+    fig = plot_training_history(history)
+
+    assert fig is not None
+    assert fig.axes[0].get_xlabel() == "Round"
+    assert fig.axes[0].get_title() == "Federated Global Training History"
+    assert list(np.asarray(fig.axes[0].lines[0].get_xdata()).astype(int)) == [1, 2, 3]
+
+
 def test_plot_training_history_handles_multiple_client_histories():
     histories = [
         {"loss": [1.0, 0.5], "accuracy": [0.2, 0.8]},

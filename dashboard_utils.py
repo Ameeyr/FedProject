@@ -148,8 +148,18 @@ def plot_training_history(history):
 
     if isinstance(history, list):
         metric_series = aggregate_training_history(history)
+        round_values = None
     else:
+        round_values = None
+        if "round" in history:
+            round_values = np.asarray(history["round"], dtype="float32").reshape(-1)
+        elif "federated_round" in history:
+            round_values = np.asarray(history["federated_round"], dtype="float32").reshape(-1)
         metric_series = _extract_metric_series(history)
+        if "round" in metric_series:
+            del metric_series["round"]
+        if "federated_round" in metric_series:
+            del metric_series["federated_round"]
 
     if not metric_series:
         fig, ax = plt.subplots(figsize=(6, 3.5))
@@ -164,12 +174,16 @@ def plot_training_history(history):
     for key in selected_keys:
         values = np.asarray(metric_series[key], dtype="float32").reshape(-1)
         if values.size:
-            ax.plot(np.arange(1, len(values) + 1), values, label=key, linewidth=1.8)
+            if round_values is not None and len(round_values) >= len(values):
+                x_values = round_values[:len(values)]
+            else:
+                x_values = np.arange(1, len(values) + 1)
+            ax.plot(x_values, values, label=key, linewidth=1.8)
     if not ax.lines:
         ax.text(0.5, 0.5, "No training metrics to plot", ha="center", va="center")
         ax.set_axis_off()
     ax.set_title("Federated Global Training History")
-    ax.set_xlabel("Epoch")
+    ax.set_xlabel("Round" if round_values is not None else "Epoch")
     ax.set_ylabel("Metric")
     ax.grid(True, alpha=0.3)
     ax.legend(loc="best")

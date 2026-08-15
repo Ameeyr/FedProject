@@ -248,15 +248,20 @@ class FederatedFlowerServer:
         if self.global_weights is not None:
             model_client.model.set_weights(self.global_weights)
 
-        loss, accuracy = model_client.model.evaluate(eval_images, eval_labels, verbose=0)
+        try:
+            loss, accuracy = model_client.model.evaluate(eval_images, eval_labels, verbose=0)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Global evaluation failed during Round {self.round + 1}: {exc}"
+            ) from exc
+
         metrics = {
             "round": self.round,
             "loss": float(loss),
             "accuracy": float(accuracy),
-            "val_loss": float(loss),
-            "val_accuracy": float(accuracy),
             "clients": len(clients),
         }
+
         self.global_round_metrics.append(metrics)
         return metrics
 
@@ -264,27 +269,28 @@ class FederatedFlowerServer:
         if not clients:
             return None
 
+        if round_train_fn is None:
+            raise ValueError(
+                "Federated rounds require fresh local training after each client receives the latest global model. "
+                "Provide a round_train_fn that retrains each client before aggregation."
+            )
+
         try:
             self._initialize_global_weights(clients)
             local_weights = []
             local_histories = []
 
-            if round_train_fn is None:
-                for client in clients:
+            for client in clients:
+                try:
                     client.model.set_weights(self.global_weights)
-                    local_weights.append(client.model.get_weights())
-            else:
-                for client in clients:
-                    try:
-                        client.model.set_weights(self.global_weights)
-                        trained_weights, local_history = round_train_fn(client)
-                        local_weights.append(trained_weights)
-                        local_histories.append(local_history)
-                    except Exception as exc:
-                        raise RuntimeError(
-                            f"Federated training failed for Client {getattr(client, 'client_id', 'unknown')} "
-                            f"during Round {self.round + 1}: local training/update operation failed: {exc}"
-                        ) from exc
+                    trained_weights, local_history = round_train_fn(client)
+                    local_weights.append(trained_weights)
+                    local_histories.append(local_history)
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"Federated training failed for Client {getattr(client, 'client_id', 'unknown')} "
+                        f"during Round {self.round + 1}: local training/update operation failed: {exc}"
+                    ) from exc
 
             aggregated_weights = self.aggregate_with_fedprox(local_weights, self.global_weights)
             self.update_global_model(aggregated_weights)

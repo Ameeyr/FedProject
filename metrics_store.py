@@ -79,6 +79,7 @@ def initialize_metrics_db(db_path=DEFAULT_METRICS_DB):
                 id INTEGER PRIMARY KEY AUTOINCREMENT,\
                 run_id TEXT NOT NULL,\
                 client TEXT,\
+                federated_round INTEGER,\
                 epoch INTEGER,\
                 loss REAL,\
                 accuracy REAL,\
@@ -87,6 +88,10 @@ def initialize_metrics_db(db_path=DEFAULT_METRICS_DB):
                 created_at TEXT NOT NULL\
             )"
         )
+        local_columns = [row[1] for row in connection.execute("PRAGMA table_info(local_client_metrics)").fetchall()]
+        if "federated_round" not in local_columns:
+            connection.execute("ALTER TABLE local_client_metrics ADD COLUMN federated_round INTEGER")
+
         connection.execute(
             "CREATE TABLE IF NOT EXISTS global_federated_metrics (\
                 id INTEGER PRIMARY KEY AUTOINCREMENT,\
@@ -143,7 +148,7 @@ def save_run_metrics(
             _to_serializable(loss),
             _to_serializable(val_loss),
         )
-        cursor = connection.execute(
+        connection.execute(
             """
             INSERT INTO run_metrics (
                 run_id,
@@ -167,13 +172,14 @@ def save_run_metrics(
 
         connection.executemany(
             """
-            INSERT INTO local_client_metrics (run_id, client, epoch, loss, accuracy, val_loss, val_accuracy, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO local_client_metrics (run_id, client, federated_round, epoch, loss, accuracy, val_loss, val_accuracy, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
                     run_id,
                     item.get("client") if isinstance(item, dict) else None,
+                    item.get("federated_round", item.get("round")) if isinstance(item, dict) else None,
                     item.get("epoch") if isinstance(item, dict) else None,
                     item.get("loss"),
                     item.get("accuracy"),
@@ -194,7 +200,7 @@ def save_run_metrics(
             [
                 (
                     run_id,
-                    item.get("round") if isinstance(item, dict) else None,
+                    item.get("federated_round", item.get("round")) if isinstance(item, dict) else None,
                     item.get("global_loss", item.get("loss")),
                     item.get("global_accuracy", item.get("accuracy")),
                     item.get("global_val_loss", item.get("val_loss")),
@@ -208,7 +214,63 @@ def save_run_metrics(
         )
 
         connection.commit()
-        return cursor.lastrowid
+        return run_id
+    finally:
+        connection.close()
+
+
+def load_run_metrics_by_id(db_path=DEFAULT_METRICS_DB, run_id=None):
+    if not run_id:
+        return None
+    connection = _connect(db_path)
+    try:
+        row = connection.execute(
+            "SELECT * FROM run_metrics WHERE run_id = ? ORDER BY id DESC LIMIT 1",
+            (str(run_id),),
+        ).fetchone()
+        if row is None:
+            return None
+        return dict(row)
+    finally:
+        connection.close()
+
+
+def load_run_local_metrics(db_path=DEFAULT_METRICS_DB, run_id=None):
+    if not run_id:
+        return []
+    connection = _connect(db_path)
+    try:
+        rows = connection.execute(
+            "SELECT * FROM local_client_metrics WHERE run_id = ? ORDER BY id ASC",
+            (str(run_id),),
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        connection.close()
+
+
+def load_run_global_metrics(db_path=DEFAULT_METRICS_DB, run_id=None):
+    if not run_id:
+        return []
+    connection = _connect(db_path)
+    try:
+        rows = connection.execute(
+            "SELECT * FROM global_federated_metrics WHERE run_id = ? ORDER BY id ASC",
+            (str(run_id),),
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        connection.close()
+
+
+def list_run_ids(db_path=DEFAULT_METRICS_DB, limit=20):
+    connection = _connect(db_path)
+    try:
+        rows = connection.execute(
+            "SELECT run_id FROM run_metrics WHERE run_id IS NOT NULL ORDER BY id DESC LIMIT ?",
+            (int(limit),),
+        ).fetchall()
+        return [str(row["run_id"]) for row in rows if row["run_id"]]
     finally:
         connection.close()
 

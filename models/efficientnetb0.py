@@ -69,6 +69,12 @@ class FederatedClient:
         print(f"Client {self.client_id} connecting to server at {self.server_address}")
 
     def train_model(self, train_data, val_data, epochs=5, batch_size=32, callbacks=None):
+        """Train locally and return the actual Keras history dict for the selected epoch count.
+
+        This preserves real metrics such as loss, accuracy, val_loss, and val_accuracy when
+        those are available from the model. It does not divide the configured epoch count or
+        fabricate placeholder values.
+        """
         train_images, train_labels = train_data
         val_images, val_labels = val_data
 
