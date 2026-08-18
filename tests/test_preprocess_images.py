@@ -60,3 +60,19 @@ def test_preprocess_images_uses_top_level_class_folders_for_nested_data(tmp_path
     assert labels.shape[0] == 4
     assert class_names == ["healthy", "parkinson"]
     assert np.array_equal(np.unique(labels), np.array([0, 1]))
+
+
+def test_split_train_val_keeps_both_classes_in_validation():
+    images = np.zeros((20, 8, 8, 3), dtype=np.float32)
+    labels = np.array([0] * 10 + [1] * 10, dtype=np.int32)
+
+    from app import split_train_val
+
+    train_data, val_data = split_train_val(images, labels, val_fraction=0.2, seed=7)
+    train_images, train_labels = train_data
+    val_images, val_labels = val_data
+
+    assert set(np.unique(train_labels)) == {0, 1}
+    assert set(np.unique(val_labels)) == {0, 1}
+    assert len(val_labels) > 0
+    assert len(train_images) + len(val_images) == len(images)

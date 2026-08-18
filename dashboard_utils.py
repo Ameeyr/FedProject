@@ -254,6 +254,16 @@ def compute_classification_metrics(y_true, y_pred, class_names):
 
 def plot_confusion_matrix(y_true, y_pred, class_names):
     labels = list(range(len(class_names)))
+    display_labels = []
+    for name in class_names:
+        normalized = str(name).strip().lower()
+        if normalized == "healthy":
+            display_labels.append("Healthy")
+        elif normalized == "parkinson":
+            display_labels.append("Parkinson")
+        else:
+            display_labels.append(str(name).title())
+
     with warnings.catch_warnings():
         warnings.filterwarnings(
             "ignore",
@@ -265,9 +275,9 @@ def plot_confusion_matrix(y_true, y_pred, class_names):
     im = ax.imshow(cm, interpolation="nearest", cmap="Blues")
     ax.set_title("Confusion Matrix")
     ax.set_xticks(np.arange(len(class_names)))
-    ax.set_xticklabels(class_names, rotation=45, ha="right")
+    ax.set_xticklabels(display_labels, rotation=45, ha="right")
     ax.set_yticks(np.arange(len(class_names)))
-    ax.set_yticklabels(class_names)
+    ax.set_yticklabels(display_labels)
     ax.set_xlabel("Predicted")
     ax.set_ylabel("Actual")
     for i in range(cm.shape[0]):

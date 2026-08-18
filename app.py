@@ -8,6 +8,7 @@ import pandas as pd
 import streamlit as st
 import tensorflow as tf
 from PIL import Image
+from sklearn.model_selection import train_test_split
 
 from dashboard_utils import (
     aggregate_training_history,
@@ -42,6 +43,9 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 WORKSPACE_ROOT = PROJECT_ROOT.parent
 DEFAULT_DATASET_PATH = WORKSPACE_ROOT / "dataset"
 DEFAULT_RESULT_DIR = WORKSPACE_ROOT / "result"
+SUPPORTED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
+HOSPITAL_CLASS_NAME_TO_ID = {"healthy": 0, "parkinson": 1}
+HOSPITAL_CLASS_NAMES = ["healthy", "parkinson"]
 
 
 def resolve_dataset_path(dataset_path, uploaded_files):
@@ -151,11 +155,131 @@ def remap_labels_to_shared_classes(labels, class_names, shared_class_names):
     if not class_names or not shared_class_names:
         return labels
     mapping = {class_name: idx for idx, class_name in enumerate(shared_class_names)}
-    remapped = np.array(labels, copy=True)
-    for original_class, original_index in enumerate(class_names):
-        if original_class in mapping:
-            remapped[remapped == original_index] = mapping[original_class]
+    remapped = np.asarray(labels, dtype=np.int32).copy()
+    class_name_list = list(class_names)
+    for class_name, target_index in mapping.items():
+        if class_name in class_name_list:
+            original_index = class_name_list.index(class_name)
+            remapped[remapped == original_index] = target_index
     return remapped.astype(np.int32)
+
+
+def _list_supported_image_files(directory):
+    directory = Path(directory).expanduser().resolve()
+    if not directory.exists():
+        return []
+    return sorted(
+        path for path in directory.rglob("*")
+        if path.is_file() and path.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS
+    )
+
+
+def validate_hospital_dataset(hospital_path):
+    hospital_dir = Path(hospital_path).expanduser().resolve()
+    if not hospital_dir.exists():
+        raise FileNotFoundError(f"Hospital path does not exist: {hospital_dir}")
+
+    class_paths = {}
+    for class_name in HOSPITAL_CLASS_NAMES:
+        class_dir = hospital_dir / class_name
+        if not class_dir.exists():
+            raise FileNotFoundError(
+                f"Hospital {hospital_dir.name} is missing the required directory: {class_name}/"
+            )
+        class_paths[class_name] = _list_supported_image_files(class_dir)
+        if not class_paths[class_name]:
+            raise ValueError(
+                f"Hospital {hospital_dir.name} contains no {class_name} images. Expected directory: {class_dir}"
+            )
+
+    healthy_paths = class_paths["healthy"]
+    parkinson_paths = class_paths["parkinson"]
+    all_paths = healthy_paths + parkinson_paths
+    labels = np.array([0] * len(healthy_paths) + [1] * len(parkinson_paths), dtype=np.int32)
+
+    print(f"\nHospital {hospital_dir.name}")
+    print(f"Healthy images: {len(healthy_paths)}")
+    print(f"Parkinson images: {len(parkinson_paths)}")
+    print(f"Total images: {len(all_paths)}")
+    print(f"Healthy path: {hospital_dir / 'healthy'}")
+    print(f"Parkinson path: {hospital_dir / 'parkinson'}")
+
+    return {
+        "hospital": hospital_dir.name,
+        "path": str(hospital_dir),
+        "healthy_count": len(healthy_paths),
+        "parkinson_count": len(parkinson_paths),
+        "total_images": len(all_paths),
+        "class_paths": class_paths,
+        "images": all_paths,
+        "labels": labels,
+        "class_names": ["healthy", "parkinson"],
+    }
+
+
+def split_hospital_train_validation(images, labels, val_fraction=0.2, random_state=42):
+    labels = np.asarray(labels).ravel()
+    if len(images) != len(labels):
+        raise ValueError("Image count and label count must match for hospital splitting.")
+    if len(images) == 0:
+        raise ValueError("Hospital dataset is empty; cannot create training and validation sets.")
+
+    unique_counts = np.unique(labels, return_counts=True)[1]
+    min_count = int(unique_counts.min()) if unique_counts.size else 0
+    if min_count == 0:
+        raise ValueError("Each hospital must contain both healthy and parkinson samples before split validation.")
+
+    if min_count >= 2:
+        train_images, val_images, train_labels, val_labels = train_test_split(
+            images,
+            labels,
+            test_size=val_fraction,
+            random_state=random_state,
+            stratify=labels,
+        )
+    else:
+        warnings = "Validation split cannot contain both classes for this hospital because one class has only one sample. Falling back to the safest possible split."
+        print(warnings)
+        rng = np.random.default_rng(random_state)
+        indices = rng.permutation(len(images))
+        split_index = max(1, int(len(images) * (1.0 - val_fraction)))
+        train_idx = indices[:split_index]
+        val_idx = indices[split_index:]
+        train_images = [images[idx] for idx in train_idx]
+        val_images = [images[idx] for idx in val_idx]
+        train_labels = labels[train_idx]
+        val_labels = labels[val_idx]
+
+    return train_images, train_labels, val_images, val_labels
+
+
+def validate_class_distribution(train_images, train_labels, val_images, val_labels):
+    train_labels = np.asarray(train_labels).ravel()
+    val_labels = np.asarray(val_labels).ravel()
+    train_counts = {int(class_id): int(np.sum(train_labels == class_id)) for class_id in np.unique(train_labels)}
+    val_counts = {int(class_id): int(np.sum(val_labels == class_id)) for class_id in np.unique(val_labels)}
+
+    summary = {
+        "train_healthy": int(train_counts.get(0, 0)),
+        "train_parkinson": int(train_counts.get(1, 0)),
+        "train_total": int(len(train_images)),
+        "val_healthy": int(val_counts.get(0, 0)),
+        "val_parkinson": int(val_counts.get(1, 0)),
+        "val_total": int(len(val_images)),
+        "training_classes_present": sorted(train_counts.keys()),
+        "validation_classes_present": sorted(val_counts.keys()),
+    }
+
+    if 0 not in train_counts:
+        raise ValueError("Training split is missing healthy samples.")
+    if 1 not in train_counts:
+        raise ValueError("Training split is missing parkinson samples.")
+    if 0 not in val_counts:
+        raise ValueError("Validation split is missing healthy samples.")
+    if 1 not in val_counts:
+        raise ValueError("Validation split is missing parkinson samples.")
+
+    return summary
 
 
 def _normalize_class_labels(uploaded_files, class_label_input):
@@ -219,21 +343,43 @@ def load_dataset(uploaded_files, target_size=(224, 224), batch_size=8, chunk_siz
 
 def load_hospital_datasets(hospital_paths, target_size=(224, 224), batch_size=8, chunk_size=256, result_dir=None):
     datasets = []
-    shared_class_names = None
     for hospital_path in hospital_paths:
-        images, labels, class_names = load_dataset(
-            uploaded_files=[],
-            target_size=target_size,
-            batch_size=batch_size,
-            chunk_size=chunk_size,
-            dataset_path=hospital_path,
-            result_dir=result_dir,
-        )
-        if shared_class_names is None:
-            shared_class_names = class_names
-        else:
-            labels = remap_labels_to_shared_classes(labels, class_names, shared_class_names)
-        datasets.append({"path": hospital_path, "images": images, "labels": labels, "class_names": shared_class_names})
+        hospital_summary = validate_hospital_dataset(hospital_path)
+        image_paths = hospital_summary["images"]
+        labels = hospital_summary["labels"]
+
+        if len(image_paths) == 0:
+            raise ValueError(f"Hospital {hospital_path} does not contain any supported images.")
+
+        image_arrays = []
+        for image_path in image_paths:
+            try:
+                with Image.open(image_path) as img:
+                    img = img.convert("RGB")
+                    img = img.resize(target_size)
+                    image_arrays.append(np.asarray(img, dtype=np.float32) / 255.0)
+            except Exception as exc:
+                raise RuntimeError(f"Failed to load image {image_path} for hospital {hospital_path}: {exc}") from exc
+
+        if not image_arrays:
+            raise ValueError(f"No readable images were found in hospital dataset at {hospital_path}.")
+
+        images = np.stack(image_arrays, axis=0)
+        train_images, train_labels, val_images, val_labels = split_hospital_train_validation(images, labels, val_fraction=0.2, random_state=42)
+        validate_class_distribution(train_images, train_labels, val_images, val_labels)
+
+        datasets.append({
+            "path": hospital_path,
+            "hospital": hospital_summary["hospital"],
+            "images": images,
+            "labels": labels,
+            "class_names": hospital_summary["class_names"],
+            "train": (train_images, train_labels),
+            "val": (val_images, val_labels),
+            "healthy_count": hospital_summary["healthy_count"],
+            "parkinson_count": hospital_summary["parkinson_count"],
+            "total_images": hospital_summary["total_images"],
+        })
     return datasets
 
 
@@ -242,16 +388,30 @@ def summarize_hospital_datasets(hospital_paths, result_dir=None):
     for hospital_path in hospital_paths:
         hospital_dir = Path(hospital_path).expanduser()
         if not hospital_dir.exists():
-            summary.append({"path": hospital_path, "exists": False, "images": 0, "classes": []})
+            summary.append({"path": hospital_path, "exists": False, "images": 0, "classes": [], "healthy": 0, "parkinson": 0})
             continue
 
-        class_names = []
-        image_count = 0
-        for child in sorted(hospital_dir.iterdir()):
-            if child.is_dir():
-                class_names.append(child.name)
-                image_count += sum(1 for _ in child.rglob("*") if _.is_file() and _.suffix.lower() in {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tif", ".tiff"})
-        summary.append({"path": str(hospital_dir), "exists": True, "images": image_count, "classes": class_names})
+        healthy_count = 0
+        parkinson_count = 0
+        classes = []
+        for class_name in ["healthy", "parkinson"]:
+            class_dir = hospital_dir / class_name
+            if class_dir.exists():
+                classes.append(class_name)
+                count = sum(1 for _ in _list_supported_image_files(class_dir))
+                if class_name == "healthy":
+                    healthy_count = count
+                else:
+                    parkinson_count = count
+        image_count = healthy_count + parkinson_count
+        summary.append({
+            "path": str(hospital_dir),
+            "exists": True,
+            "images": image_count,
+            "classes": classes,
+            "healthy": healthy_count,
+            "parkinson": parkinson_count,
+        })
     return summary
 
 
@@ -368,12 +528,33 @@ def build_global_metrics(server_metrics, clients_count=0):
 
 
 def split_train_val(images, labels, val_fraction=0.2, seed=42):
+    images = np.asarray(images)
+    labels = np.asarray(labels).ravel()
+
+    if len(images) == 0:
+        raise ValueError("Dataset is empty; cannot create train/validation split.")
+    if len(images) != len(labels):
+        raise ValueError("Image count and label count must match for the train/validation split.")
     if len(images) < 2:
         return (images, labels), (images[:1], labels[:1])
 
+    unique_classes, counts = np.unique(labels, return_counts=True)
+    if len(unique_classes) < 2:
+        raise ValueError("Each hospital must contain both healthy and parkinson samples before the train/validation split.")
+
+    if counts.min() >= 2:
+        train_images, val_images, train_labels, val_labels = train_test_split(
+            images,
+            labels,
+            test_size=val_fraction,
+            random_state=seed,
+            stratify=labels,
+        )
+        return (train_images, train_labels), (val_images, val_labels)
+
     rng = np.random.default_rng(seed)
     indices = rng.permutation(len(images))
-    split_index = max(1, int((1 - val_fraction) * len(images)))
+    split_index = max(1, int(len(images) * (1.0 - val_fraction)))
     train_idx = indices[:split_index]
     val_idx = indices[split_index:]
     return (images[train_idx], labels[train_idx]), (images[val_idx], labels[val_idx])
@@ -499,11 +680,35 @@ def explain_prediction(client, image, class_names, target_layer_name):
     prediction = client.model.predict(np.expand_dims(image, axis=0), verbose=0)[0]
     if prediction.ndim == 1 and len(prediction) == 1:
         probability = float(prediction[0])
+        class_names = list(class_names) if class_names else ["class_0", "class_1"]
+        if len(class_names) < 2:
+            class_names = ["class_0", "class_1"]
         predicted_class = class_names[1 if probability >= 0.5 else 0]
     else:
+        class_names = list(class_names) if class_names else ["class_0", "class_1"]
         predicted_class = class_names[int(np.argmax(prediction))]
     overlay = gradcam.overlay_heatmap(image, heatmap, alpha=0.55)
     return heatmap, overlay, predicted_class, prediction
+
+
+def summarize_prediction_probabilities(prediction, class_names):
+    labels = list(class_names) if class_names else ["class_0", "class_1"]
+    if len(labels) < 2:
+        labels = ["class_0", "class_1"]
+
+    prob_vector = np.asarray(prediction, dtype="float32").ravel()
+    if prob_vector.size == 1:
+        positive_prob = float(prob_vector[0])
+        negative_prob = 1.0 - positive_prob
+        return {
+            labels[0]: float(negative_prob),
+            labels[1]: float(positive_prob),
+        }
+
+    probs = [float(value) for value in prob_vector[: len(labels)]]
+    if len(probs) < len(labels):
+        probs = probs + [0.0] * (len(labels) - len(probs))
+    return {label: float(prob) for label, prob in zip(labels, probs)}
 
 
 def resolve_target_layer_name(target_layer_name):
@@ -516,6 +721,12 @@ def resolve_target_layer_name(target_layer_name):
 
 
 def select_explainability_samples(images, labels, class_names, max_samples=4):
+    if images is None or labels is None:
+        return []
+    if not hasattr(images, "__len__"):
+        return []
+    if len(images) == 0:
+        return []
     if len(images) <= max_samples:
         return list(range(len(images)))
 
@@ -601,6 +812,8 @@ with st.sidebar:
     st.caption("Local hospital data and a central federated server are used together here.")
     with st.form("pipeline_config"):
         uploaded_files = st.file_uploader("Upload raw medical images", type=["png", "jpg", "jpeg", "bmp"], accept_multiple_files=True)
+        if uploaded_files:
+            st.caption(f"{len(uploaded_files)} uploaded image(s) detected. Click Run pipeline to preprocess and use them in training or Grad-CAM.")
         hospital_dataset_paths = st.text_area(
             "Hospital dataset paths",
             value="",
@@ -633,6 +846,10 @@ with st.sidebar:
         proximal_mu = st.number_input("FedProx mu", min_value=0.0, max_value=1.0, value=0.01, step=0.01, help="Only used when FedProx is selected")
         federated_rounds = st.number_input("Federated rounds", min_value=1, max_value=5, value=1, step=1)
         run_button = st.form_submit_button("Run pipeline")
+
+display_images = st.session_state.get("processed_dataset", {}).get("images")
+display_labels = st.session_state.get("processed_dataset", {}).get("labels")
+display_class_names = st.session_state.get("processed_dataset", {}).get("class_names")
 
 if run_button:
     dataset_path = None
@@ -683,6 +900,14 @@ if run_button:
                 result_dir=result_dir,
             )
             hospital_datasets = [{"images": images, "labels": labels, "class_names": class_names}]
+        st.session_state["processed_dataset"] = {
+            "images": images,
+            "labels": labels,
+            "class_names": class_names,
+        }
+        display_images = images
+        display_labels = labels
+        display_class_names = class_names
         _append_run_log("Preprocessing finished. Starting training...")
         status_placeholder.success("Preprocessing finished. Starting training...")
 
@@ -900,11 +1125,18 @@ if run_button:
             grouped_by_hospital.setdefault(f"Hospital {hospital_id}", {})[round_number] = entry.get("history", entry)
 
         hospital_names = sorted(grouped_by_hospital, key=lambda name: str(name))
-        selected_hospital = st.selectbox("Select Hospital", options=hospital_names)
-        selected_round = st.selectbox(
-            "Select Federated Round",
-            options=sorted(grouped_by_hospital[selected_hospital]),
-        )
+        with st.form("hospital_round_view"):
+            selected_hospital = st.selectbox(
+                "Select Hospital",
+                options=hospital_names,
+                key="selected_hospital_name",
+            )
+            selected_round = st.selectbox(
+                "Select Federated Round",
+                options=sorted(grouped_by_hospital[selected_hospital]),
+                key="selected_round_number",
+            )
+            st.form_submit_button("Apply view")
         history = grouped_by_hospital[selected_hospital][selected_round]
         st.subheader(f"{selected_hospital} • Round {selected_round}")
 
@@ -943,12 +1175,16 @@ if run_button:
             "val_loss": "Validation Loss",
             "val_accuracy": "Validation Accuracy",
             "clients": "Clients",
+            "validation_samples": "Validation Samples",
+            "local_validation_samples": "Validation Samples",
         }.items():
             if existing in round_metrics_df.columns:
                 round_metrics_df = round_metrics_df.rename(columns={existing: target})
 
         if "Round" not in round_metrics_df.columns:
             round_metrics_df["Round"] = np.arange(1, len(round_metrics_df) + 1)
+        if "Validation Samples" not in round_metrics_df.columns:
+            round_metrics_df["Validation Samples"] = np.nan
 
         validation_columns = ["Validation Loss", "Validation Accuracy"]
         for column_name in validation_columns:
@@ -1121,38 +1357,61 @@ if run_button:
         st.info("No prior run metrics were stored yet.")
 
     st.subheader("Explainability (Grad-CAM, computed locally on the client model)")
+    if display_images is None and uploaded_files:
+        try:
+            display_images, display_labels, display_class_names = load_dataset(
+                uploaded_files,
+                batch_size=batch_size,
+                chunk_size=chunk_size,
+                dataset_path=dataset_path,
+                result_dir=result_dir,
+            )
+            st.session_state["processed_dataset"] = {
+                "images": display_images,
+                "labels": display_labels,
+                "class_names": display_class_names,
+            }
+        except Exception as exc:
+            st.warning(f"Uploaded image preprocessing failed for Grad-CAM preview: {exc}")
     resolved_target_layer = resolve_target_layer_name(target_layer_name)
-    sample_indices = select_explainability_samples(images, labels, class_names, max_samples=4)
+    sample_indices = select_explainability_samples(display_images, display_labels, display_class_names, max_samples=4)
 
-    st.caption("A small sample gallery shows how the model attends to different images and classes.")
-    for sample_index in sample_indices:
-        preview_image = images[sample_index]
-        true_label = int(labels[sample_index]) if labels is not None and sample_index < len(labels) else None
-        heatmap, overlay, predicted_class, prediction = explain_prediction(
-            aggregated_client,
-            preview_image,
-            class_names,
-            resolved_target_layer,
-        )
+    if not sample_indices:
+        st.info("No valid images were loaded for explainability preview. Upload images or run preprocessing to enable Grad-CAM visualizations.")
+    else:
+        st.caption("A small sample gallery shows how the model attends to different images and classes.")
+        for sample_index in sample_indices:
+            preview_image = display_images[sample_index]
+            true_label = int(display_labels[sample_index]) if display_labels is not None and sample_index < len(display_labels) else None
+            heatmap, overlay, predicted_class, prediction = explain_prediction(
+                aggregated_client,
+                preview_image,
+                display_class_names,
+                resolved_target_layer,
+            )
 
-        preview_image = np.asarray(preview_image).astype("float32")
-        if preview_image.max() > 1.0 or preview_image.min() < 0.0:
-            preview_image = (preview_image - preview_image.min()) / max(preview_image.max() - preview_image.min(), 1e-8)
+            preview_image = np.asarray(preview_image).astype("float32")
+            if preview_image.max() > 1.0 or preview_image.min() < 0.0:
+                preview_image = (preview_image - preview_image.min()) / max(preview_image.max() - preview_image.min(), 1e-8)
 
-        heatmap = np.asarray(heatmap).astype("float32")
-        if heatmap.max() > 1.0 or heatmap.min() < 0.0:
-            heatmap = (heatmap - heatmap.min()) / max(heatmap.max() - heatmap.min(), 1e-8)
+            heatmap = np.asarray(heatmap).astype("float32")
+            if heatmap.max() > 1.0 or heatmap.min() < 0.0:
+                heatmap = (heatmap - heatmap.min()) / max(heatmap.max() - heatmap.min(), 1e-8)
 
-        st.write(f"Sample {sample_index + 1}: predicted {predicted_class}" + (f" • true {class_names[true_label]}" if true_label is not None else ""))
-        st.write(f"Prediction probabilities: {np.round(prediction, 3)}")
+            probability_map = summarize_prediction_probabilities(prediction, display_class_names)
+            st.write(f"Sample {sample_index + 1}: predicted {predicted_class}" + (f" • true {display_class_names[true_label]}" if true_label is not None and true_label < len(display_class_names) else ""))
+            st.write(
+                "Prediction probabilities: "
+                + ", ".join(f"{label}={value:.3f}" for label, value in probability_map.items())
+            )
 
-        image_col, overlay_col = st.columns(2)
-        with image_col:
-            st_image_compat(preview_image, caption="Input image", use_container_width=True)
-        with overlay_col:
-            st_image_compat(overlay, caption="Grad-CAM overlay", use_container_width=True)
+            image_col, overlay_col = st.columns(2)
+            with image_col:
+                st_image_compat(preview_image, caption="Input image", use_container_width=True)
+            with overlay_col:
+                st_image_compat(overlay, caption="Grad-CAM overlay", use_container_width=True)
 
-        with st.expander("Raw Grad-CAM heatmap"):
-            st_image_compat(heatmap, caption="Raw heatmap", use_container_width=True)
+            with st.expander("Raw Grad-CAM heatmap"):
+                st_image_compat(heatmap, caption="Raw heatmap", use_container_width=True)
 
-        st.divider()
+            st.divider()
