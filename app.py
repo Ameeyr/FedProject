@@ -341,7 +341,7 @@ def load_dataset(uploaded_files, target_size=(224, 224), batch_size=8, chunk_siz
         return images, labels, class_names
 
 
-def load_hospital_datasets(hospital_paths, target_size=(224, 224), batch_size=8, chunk_size=256, result_dir=None):
+def load_hospital_datasets(hospital_paths, target_size=(224, 224), batch_size=8, chunk_size=256, result_dir=None, max_samples=None, random_state=42):
     datasets = []
     for hospital_path in hospital_paths:
         hospital_summary = validate_hospital_dataset(hospital_path)
@@ -350,6 +350,24 @@ def load_hospital_datasets(hospital_paths, target_size=(224, 224), batch_size=8,
 
         if len(image_paths) == 0:
             raise ValueError(f"Hospital {hospital_path} does not contain any supported images.")
+
+        if max_samples is not None:
+            max_samples = max(2, int(max_samples))
+            healthy_paths = hospital_summary["class_paths"]["healthy"]
+            parkinson_paths = hospital_summary["class_paths"]["parkinson"]
+            healthy_cap = min(len(healthy_paths), max(1, max_samples // 2))
+            parkinson_cap = min(len(parkinson_paths), max(1, max_samples // 2))
+            if healthy_cap + parkinson_cap < max_samples:
+                extra_slots = max_samples - (healthy_cap + parkinson_cap)
+                healthy_cap += min(extra_slots, len(healthy_paths) - healthy_cap)
+                parkinson_cap += min(max(0, extra_slots - max(0, len(healthy_paths) - healthy_cap)), len(parkinson_paths) - parkinson_cap)
+            rng = np.random.default_rng(random_state)
+            healthy_selected = rng.choice(healthy_paths, size=healthy_cap, replace=False).tolist() if healthy_paths else []
+            parkinson_selected = rng.choice(parkinson_paths, size=parkinson_cap, replace=False).tolist() if parkinson_paths else []
+            selected_paths = healthy_selected + parkinson_selected
+            selected_labels = np.array([0] * len(healthy_selected) + [1] * len(parkinson_selected), dtype=np.int32)
+            image_paths = selected_paths
+            labels = selected_labels
 
         image_arrays = []
         for image_path in image_paths:
@@ -376,9 +394,9 @@ def load_hospital_datasets(hospital_paths, target_size=(224, 224), batch_size=8,
             "class_names": hospital_summary["class_names"],
             "train": (train_images, train_labels),
             "val": (val_images, val_labels),
-            "healthy_count": hospital_summary["healthy_count"],
-            "parkinson_count": hospital_summary["parkinson_count"],
-            "total_images": hospital_summary["total_images"],
+            "healthy_count": int(np.sum(labels == 0)),
+            "parkinson_count": int(np.sum(labels == 1)),
+            "total_images": int(len(labels)),
         })
     return datasets
 
@@ -887,6 +905,7 @@ if run_button:
                 batch_size=batch_size,
                 chunk_size=chunk_size,
                 result_dir=result_dir,
+                max_samples=int(max_samples),
             )
             class_names = hospital_datasets[0]["class_names"]
             images = None
