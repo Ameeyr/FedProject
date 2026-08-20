@@ -76,3 +76,29 @@ def test_split_train_val_keeps_both_classes_in_validation():
     assert set(np.unique(val_labels)) == {0, 1}
     assert len(val_labels) > 0
     assert len(train_images) + len(val_images) == len(images)
+
+
+def test_compute_final_global_metrics_uses_combined_validation_data():
+    from app import compute_final_global_metrics
+
+    class DummyClient:
+        def __init__(self):
+            self.client_id = 1
+            self.model = type("Model", (), {"predict": lambda self, x, verbose=0: np.array([[0.9], [0.1], [0.8], [0.2]]), "set_weights": lambda self, weights: None})()
+
+    class DummyServer:
+        def __init__(self):
+            self.global_weights = [np.array([1.0], dtype=np.float32)]
+
+    server = DummyServer()
+    client = DummyClient()
+    global_validation_data = (
+        np.zeros((4, 8, 8, 3), dtype=np.float32),
+        np.array([0, 1, 0, 1], dtype=np.int32),
+    )
+
+    result = compute_final_global_metrics(server, [client], ["healthy", "parkinson"], global_validation_data=global_validation_data)
+
+    assert set(np.unique(result["true_labels"])) == {0, 1}
+    assert set(np.unique(result["pred_labels"])) == {0, 1}
+    assert "accuracy" in result["metrics"]

@@ -225,39 +225,62 @@ def validate_hospital_dataset(hospital_path):
 
 
 def split_hospital_train_validation(images, labels, val_fraction=0.2, random_state=42):
+    images = np.asarray(images)
     labels = np.asarray(labels).ravel()
-    if len(images) != len(labels):
-        raise ValueError("Image count and label count must match for hospital splitting.")
+
     if len(images) == 0:
-        raise ValueError("Hospital dataset is empty; cannot create training and validation sets.")
+        raise ValueError("Dataset is empty; cannot create train/validation split.")
+    if len(images) != len(labels):
+        raise ValueError("Image count and label count must match for the train/validation split.")
 
-    unique_counts = np.unique(labels, return_counts=True)[1]
-    min_count = int(unique_counts.min()) if unique_counts.size else 0
-    if min_count == 0:
-        raise ValueError("Each hospital must contain both healthy and parkinson samples before split validation.")
+    unique_classes, counts = np.unique(labels, return_counts=True)
+    if len(unique_classes) < 2:
+        raise ValueError("Each hospital must contain both healthy and parkinson samples before the train/validation split.")
 
-    if min_count >= 2:
-        train_images, val_images, train_labels, val_labels = train_test_split(
-            images,
-            labels,
-            test_size=val_fraction,
-            random_state=random_state,
-            stratify=labels,
+    if counts.min() < 2:
+        raise ValueError(
+            "Each class must contain at least 2 samples to create a valid two-class validation split. "
+            f"Class counts: {dict(zip(unique_classes.tolist(), counts.tolist()))}"
         )
-    else:
-        warnings = "Validation split cannot contain both classes for this hospital because one class has only one sample. Falling back to the safest possible split."
-        print(warnings)
-        rng = np.random.default_rng(random_state)
-        indices = rng.permutation(len(images))
-        split_index = max(1, int(len(images) * (1.0 - val_fraction)))
-        train_idx = indices[:split_index]
-        val_idx = indices[split_index:]
-        train_images = [images[idx] for idx in train_idx]
-        val_images = [images[idx] for idx in val_idx]
-        train_labels = labels[train_idx]
-        val_labels = labels[val_idx]
+
+    rng = np.random.default_rng(random_state)
+    train_indices = []
+    val_indices = []
+    for class_id in sorted(unique_classes.tolist()):
+        class_indices = np.flatnonzero(labels == class_id)
+        rng.shuffle(class_indices)
+        class_val_count = max(1, int(round(len(class_indices) * val_fraction)))
+        if class_val_count >= len(class_indices):
+            class_val_count = len(class_indices) - 1
+            if class_val_count <= 0:
+                raise ValueError(f"Class {class_id} has too few samples for a valid validation split.")
+        train_indices.append(class_indices[:-class_val_count])
+        val_indices.append(class_indices[-class_val_count:])
+
+    train_idx = np.concatenate(train_indices)
+    val_idx = np.concatenate(val_indices)
+    train_images = images[train_idx]
+    train_labels = labels[train_idx]
+    val_images = images[val_idx]
+    val_labels = labels[val_idx]
+
+    if np.unique(train_labels).tolist() != sorted(unique_classes.tolist()) or np.unique(val_labels).tolist() != sorted(unique_classes.tolist()):
+        raise ValueError(
+            "The train/validation split failed to retain both classes. "
+            f"train_labels={np.unique(train_labels).tolist()}, val_labels={np.unique(val_labels).tolist()}"
+        )
 
     return train_images, train_labels, val_images, val_labels
+
+
+def split_train_val(images, labels, val_fraction=0.2, seed=42):
+    train_images, train_labels, val_images, val_labels = split_hospital_train_validation(
+        images,
+        labels,
+        val_fraction=val_fraction,
+        random_state=seed,
+    )
+    return (train_images, train_labels), (val_images, val_labels)
 
 
 def validate_class_distribution(train_images, train_labels, val_images, val_labels):
@@ -362,12 +385,22 @@ def load_hospital_datasets(hospital_paths, target_size=(224, 224), batch_size=8,
             max_samples = max(2, int(max_samples))
             healthy_paths = hospital_summary["class_paths"]["healthy"]
             parkinson_paths = hospital_summary["class_paths"]["parkinson"]
+
             healthy_cap = min(len(healthy_paths), max(1, max_samples // 2))
             parkinson_cap = min(len(parkinson_paths), max(1, max_samples // 2))
-            if healthy_cap + parkinson_cap < max_samples:
-                extra_slots = max_samples - (healthy_cap + parkinson_cap)
-                healthy_cap += min(extra_slots, len(healthy_paths) - healthy_cap)
-                parkinson_cap += min(max(0, extra_slots - max(0, len(healthy_paths) - healthy_cap)), len(parkinson_paths) - parkinson_cap)
+            remaining_slots = max_samples - (healthy_cap + parkinson_cap)
+            while remaining_slots > 0:
+                if len(healthy_paths) > healthy_cap and healthy_cap < len(healthy_paths):
+                    healthy_cap += 1
+                    remaining_slots -= 1
+                elif len(parkinson_paths) > parkinson_cap and parkinson_cap < len(parkinson_paths):
+                    parkinson_cap += 1
+                    remaining_slots -= 1
+                else:
+                    break
+            if healthy_cap == 0 or parkinson_cap == 0:
+                raise ValueError(f"max_samples={max_samples} would discard one class in hospital {hospital_path}. Keep both classes in the selected subset.")
+
             rng = np.random.default_rng(random_state)
             healthy_selected = rng.choice(healthy_paths, size=healthy_cap, replace=False).tolist() if healthy_paths else []
             parkinson_selected = rng.choice(parkinson_paths, size=parkinson_cap, replace=False).tolist() if parkinson_paths else []
@@ -375,6 +408,13 @@ def load_hospital_datasets(hospital_paths, target_size=(224, 224), batch_size=8,
             selected_labels = np.array([0] * len(healthy_selected) + [1] * len(parkinson_selected), dtype=np.int32)
             image_paths = selected_paths
             labels = selected_labels
+
+        print(f"\nHospital {hospital_summary['hospital']} dataset diagnostics")
+        print(f"healthy images: {len(hospital_summary['class_paths']['healthy'])}")
+        print(f"parkinson images: {len(hospital_summary['class_paths']['parkinson'])}")
+        print(f"total images: {len(hospital_summary['images'])}")
+        print(f"label 0 count: {int(np.sum(labels == 0))}")
+        print(f"label 1 count: {int(np.sum(labels == 1))}")
 
         image_arrays = []
         for image_path in image_paths:
@@ -392,6 +432,8 @@ def load_hospital_datasets(hospital_paths, target_size=(224, 224), batch_size=8,
         images = np.stack(image_arrays, axis=0)
         train_images, train_labels, val_images, val_labels = split_hospital_train_validation(images, labels, val_fraction=0.2, random_state=42)
         validate_class_distribution(train_images, train_labels, val_images, val_labels)
+        print(f"Hospital {hospital_summary['hospital']} training split: healthy={int(np.sum(train_labels == 0))}, parkinson={int(np.sum(train_labels == 1))}")
+        print(f"Hospital {hospital_summary['hospital']} validation split: healthy={int(np.sum(val_labels == 0))}, parkinson={int(np.sum(val_labels == 1))}")
 
         datasets.append({
             "path": hospital_path,
@@ -552,37 +594,70 @@ def build_global_metrics(server_metrics, clients_count=0):
     return rows
 
 
-def split_train_val(images, labels, val_fraction=0.2, seed=42):
-    images = np.asarray(images)
-    labels = np.asarray(labels).ravel()
+def combine_validation_sets(client_eval_data):
+    image_chunks = []
+    label_chunks = []
+    for client_id in sorted(client_eval_data.keys()):
+        val_data = client_eval_data.get(client_id)
+        if val_data is None:
+            continue
+        val_images, val_labels = val_data
+        if val_images is None or val_labels is None:
+            continue
+        image_chunks.append(np.asarray(val_images))
+        label_chunks.append(np.asarray(val_labels).ravel())
 
-    if len(images) == 0:
-        raise ValueError("Dataset is empty; cannot create train/validation split.")
-    if len(images) != len(labels):
-        raise ValueError("Image count and label count must match for the train/validation split.")
-    if len(images) < 2:
-        return (images, labels), (images[:1], labels[:1])
+    if not image_chunks:
+        raise ValueError("No validation data is available for the global evaluation dataset.")
 
-    unique_classes, counts = np.unique(labels, return_counts=True)
-    if len(unique_classes) < 2:
-        raise ValueError("Each hospital must contain both healthy and parkinson samples before the train/validation split.")
+    combined_images = np.concatenate(image_chunks, axis=0)
+    combined_labels = np.concatenate(label_chunks, axis=0).astype(np.int32)
+    counts = summarize_validation_class_distribution(combined_images, combined_labels)
+    if counts.get(0, 0) == 0:
+        raise ValueError("Global validation dataset is missing healthy samples. Parkinson class may be absent or discarded upstream.")
+    if counts.get(1, 0) == 0:
+        raise ValueError("Global validation dataset is missing parkinson samples. Do not continue with a one-class evaluation set.")
 
-    if counts.min() >= 2:
-        train_images, val_images, train_labels, val_labels = train_test_split(
-            images,
-            labels,
-            test_size=val_fraction,
-            random_state=seed,
-            stratify=labels,
-        )
-        return (train_images, train_labels), (val_images, val_labels)
+    print("\nGLOBAL EVALUATION DATASET")
+    print(f"healthy = {counts.get(0, 0)}")
+    print(f"parkinson = {counts.get(1, 0)}")
+    print(f"total = {len(combined_labels)}")
+    print(f"unique labels = {np.unique(combined_labels).tolist()}")
+    return combined_images, combined_labels
 
-    rng = np.random.default_rng(seed)
-    indices = rng.permutation(len(images))
-    split_index = max(1, int(len(images) * (1.0 - val_fraction)))
-    train_idx = indices[:split_index]
-    val_idx = indices[split_index:]
-    return (images[train_idx], labels[train_idx]), (images[val_idx], labels[val_idx])
+
+def compute_final_global_metrics(server, clients, class_names, global_validation_data=None, client_eval_data=None):
+    validation_data = global_validation_data
+    if validation_data is None and client_eval_data is not None:
+        validation_data = combine_validation_sets(client_eval_data)
+
+    if validation_data is None:
+        raise ValueError("A combined validation dataset is required to compute global metrics from real predictions.")
+
+    eval_images, eval_labels = validation_data
+    eval_images = np.asarray(eval_images)
+    eval_labels = np.asarray(eval_labels).ravel().astype(np.int32)
+    counts = summarize_validation_class_distribution(eval_images, eval_labels)
+    if counts.get(0, 0) == 0:
+        raise ValueError("The final validation set contains zero healthy samples; this is not valid for a binary classification report.")
+    if counts.get(1, 0) == 0:
+        raise ValueError("The final validation set contains zero parkinson samples; this is not valid for a binary classification report.")
+
+    model_client = clients[0] if clients else None
+    if model_client is None:
+        raise ValueError("At least one client model is required to compute final metrics.")
+
+    if getattr(server, "global_weights", None) is not None:
+        model_client.model.set_weights(server.global_weights)
+
+    pred_labels, true_labels = build_confusion_metrics(model_client, (eval_images, eval_labels), class_names)
+    metrics = compute_classification_metrics(true_labels, pred_labels, list(class_names))
+    return {
+        "metrics": metrics,
+        "pred_labels": np.asarray(pred_labels).ravel(),
+        "true_labels": np.asarray(true_labels).ravel(),
+        "validation_data": (eval_images, eval_labels),
+    }
 
 
 def run_training(images, labels, class_names, model_name, max_samples, epochs, batch_size):
@@ -876,6 +951,14 @@ display_images = st.session_state.get("processed_dataset", {}).get("images")
 display_labels = st.session_state.get("processed_dataset", {}).get("labels")
 display_class_names = st.session_state.get("processed_dataset", {}).get("class_names")
 
+history_by_client = st.session_state.get("last_run_history_by_client", [])
+server = st.session_state.get("last_run_server")
+clients = st.session_state.get("last_run_clients", [])
+client_eval_data = st.session_state.get("last_run_client_eval_data", {})
+class_names = st.session_state.get("last_run_class_names", HOSPITAL_CLASS_NAMES)
+metrics_db_path = Path(st.session_state.get("last_run_metrics_db_path", str(DEFAULT_RESULT_DIR / "training_metrics.db")))
+aggregated_client = st.session_state.get("last_run_aggregated_client")
+
 if run_button:
     dataset_path = None
     hospital_paths = parse_hospital_dataset_paths(hospital_dataset_paths)
@@ -1004,6 +1087,7 @@ if run_button:
         st.error("No valid hospital clients were created. Check that each hospital dataset contains enough labeled images.")
         st.stop()
 
+    global_validation_data = combine_validation_sets(client_eval_data)
     st.success("Initialized global model and hospital clients for federated training")
 
     server = FederatedFlowerServer(model_name=model_name, aggregation_mode=aggregation_mode, mu=proximal_mu)
@@ -1027,7 +1111,7 @@ if run_button:
                         client_datasets=client_datasets,
                         epochs=int(epochs),
                         batch_size=int(batch_size),
-                        eval_data=client_eval_data,
+                        eval_data=global_validation_data,
                         aggregation_mode=aggregation_mode,
                         mu=proximal_mu,
                     )
@@ -1040,7 +1124,7 @@ if run_button:
                     client_datasets=client_datasets,
                     epochs=int(epochs),
                     batch_size=int(batch_size),
-                    eval_data=client_eval_data,
+                    eval_data=global_validation_data,
                 )
         else:
             single_client_eval = client_eval_data.get(1, (train_images, train_labels))
@@ -1095,7 +1179,7 @@ if run_button:
     history = aggregate_training_history([
         item.get("history", item) for item in history_by_client if isinstance(item, dict)
     ])
-    final_global_eval = server.evaluate_global_model(clients, client_eval_data) if client_eval_data else None
+    final_global_eval = server.evaluate_global_model(clients, global_validation_data) if global_validation_data else None
     accuracy = float(final_global_eval["accuracy"]) if isinstance(final_global_eval, dict) and "accuracy" in final_global_eval else 0.0
 
     accuracy_status = "Met" if accuracy >= float(target_accuracy) else "Below target"
@@ -1132,6 +1216,13 @@ if run_button:
         val_loss=None,
     )
     st.session_state["current_run_id"] = run_id
+    st.session_state["last_run_history_by_client"] = history_by_client
+    st.session_state["last_run_server"] = server
+    st.session_state["last_run_clients"] = clients
+    st.session_state["last_run_client_eval_data"] = client_eval_data
+    st.session_state["last_run_class_names"] = class_names
+    st.session_state["last_run_metrics_db_path"] = str(metrics_db_path)
+    st.session_state["last_run_aggregated_client"] = aggregated_client
     _append_run_log(f"Saved training metrics to {metrics_db_path} (run_id={run_id})")
 
     st.success("Federated aggregation completed")
@@ -1152,51 +1243,67 @@ if run_button:
             st.metric(label, str(value))
 
     st.markdown("## SECTION A: LOCAL CLIENT TRAINING")
-    valid_history_entries = [entry for entry in history_by_client if isinstance(entry, dict) and has_valid_training_history(entry.get("history", entry))]
-    if valid_history_entries:
-        grouped_by_hospital = {}
-        for entry in valid_history_entries:
-            hospital_id = entry.get("client_id", "unknown")
-            round_number = entry.get("federated_round", 1)
-            grouped_by_hospital.setdefault(f"Hospital {hospital_id}", {})[round_number] = entry.get("history", entry)
+    if not history_by_client or server is None:
+        st.info("Run the federated pipeline first to generate hospital and round history.")
+    else:
+        valid_history_entries = [entry for entry in history_by_client if isinstance(entry, dict) and has_valid_training_history(entry.get("history", entry))]
+        if valid_history_entries:
+            grouped_by_hospital = {}
+            for entry in valid_history_entries:
+                hospital_id = entry.get("client_id", "unknown")
+                round_number = entry.get("federated_round", 1)
+                grouped_by_hospital.setdefault(f"Hospital {hospital_id}", {})[round_number] = entry.get("history", entry)
 
-        hospital_names = sorted(grouped_by_hospital, key=lambda name: str(name))
-        with st.form("hospital_round_view"):
+            hospital_names = sorted(grouped_by_hospital, key=lambda name: str(name))
+            default_hospital = hospital_names[0]
+            selected_hospital = st.session_state.get("selected_hospital_name")
+            if selected_hospital not in hospital_names:
+                selected_hospital = default_hospital
             selected_hospital = st.selectbox(
                 "Select Hospital",
                 options=hospital_names,
+                index=hospital_names.index(selected_hospital),
                 key="selected_hospital_name",
             )
+
+            round_options = sorted(grouped_by_hospital[selected_hospital])
+            default_round = round_options[0]
+            selected_round = st.session_state.get("selected_round_number")
+            if selected_round not in round_options:
+                selected_round = default_round
             selected_round = st.selectbox(
                 "Select Federated Round",
-                options=sorted(grouped_by_hospital[selected_hospital]),
+                options=round_options,
+                index=round_options.index(selected_round),
                 key="selected_round_number",
             )
-            st.form_submit_button("Apply view")
-        history = grouped_by_hospital[selected_hospital][selected_round]
-        st.subheader(f"{selected_hospital} • Round {selected_round}")
 
-        metric_cols = st.columns(4)
-        metric_keys = ["loss", "val_loss", "accuracy", "val_accuracy"]
-        for col_idx, key in enumerate(metric_keys):
-            values = history.get(key, [])
-            value = float(np.asarray(values).reshape(-1)[-1]) if isinstance(values, (list, tuple, np.ndarray)) and np.asarray(values).size > 0 else None
-            label = {
-                "loss": "Training Loss",
-                "val_loss": "Validation Loss",
-                "accuracy": "Training Accuracy",
-                "val_accuracy": "Validation Accuracy",
-            }.get(key, key.replace("_", " ").title())
-            with metric_cols[col_idx]:
-                st.metric(label, f"{value:.4f}" if value is not None else "N/A")
+            st.session_state["selected_hospital_name"] = selected_hospital
+            st.session_state["selected_round_number"] = selected_round
+            history = grouped_by_hospital[selected_hospital][selected_round]
+            st.subheader(f"{selected_hospital} • Round {selected_round}")
 
-        st.caption("X-axis = Epoch")
-        st.pyplot(plot_training_history(history))
-    else:
-        st.info("Local client training history will appear here only after at least one hospital produces a valid local training history.")
+            metric_cols = st.columns(4)
+            metric_keys = ["loss", "val_loss", "accuracy", "val_accuracy"]
+            for col_idx, key in enumerate(metric_keys):
+                values = history.get(key, [])
+                value = float(np.asarray(values).reshape(-1)[-1]) if isinstance(values, (list, tuple, np.ndarray)) and np.asarray(values).size > 0 else None
+                label = {
+                    "loss": "Training Loss",
+                    "val_loss": "Validation Loss",
+                    "accuracy": "Training Accuracy",
+                    "val_accuracy": "Validation Accuracy",
+                }.get(key, key.replace("_", " ").title())
+                with metric_cols[col_idx]:
+                    st.metric(label, f"{value:.4f}" if value is not None else "N/A")
+
+            st.caption("X-axis = Epoch")
+            st.pyplot(plot_training_history(history))
+        else:
+            st.info("Local client training history will appear here only after at least one hospital produces a valid local training history.")
 
     st.markdown("## SECTION B: GLOBAL FEDERATED TRAINING")
-    if server.global_round_metrics:
+    if server is not None and getattr(server, "global_round_metrics", None):
         round_metrics_df = pd.DataFrame(server.global_round_metrics)
         if "round" not in round_metrics_df.columns and "federated_round" in round_metrics_df.columns:
             round_metrics_df = round_metrics_df.rename(columns={"federated_round": "round"})
@@ -1290,26 +1397,32 @@ if run_button:
         st.info("Federated global training history will appear after the first aggregation step.")
 
     st.subheader("FINAL GLOBAL MODEL PERFORMANCE")
-    if len(clients) > 1:
-        combined_true = []
-        combined_pred = []
-        for client_id, val_data in sorted(client_eval_data.items()):
-            if val_data is None:
-                continue
-            client_model = next((client for client in clients if getattr(client, "client_id", None) == client_id), None)
-            if client_model is None:
-                continue
-            client_model.model.set_weights(server.global_weights)
-            local_pred_labels, local_true_labels = build_confusion_metrics(client_model, val_data, class_names)
-            combined_true.extend(np.asarray(local_true_labels).ravel().tolist())
-            combined_pred.extend(np.asarray(local_pred_labels).ravel().tolist())
-        if combined_true and combined_pred:
-            metrics = compute_classification_metrics(np.asarray(combined_true), np.asarray(combined_pred), list(class_names))
-        else:
-            metrics = {"accuracy": None, "precision": None, "recall": None, "f1_score": None, "sensitivity": None, "specificity": None}
+    metrics = {
+        "accuracy": None,
+        "precision": None,
+        "recall": None,
+        "f1_score": None,
+        "sensitivity": None,
+        "specificity": None,
+    }
+    pred_labels = np.array([], dtype=np.int32)
+    true_labels = np.array([], dtype=np.int32)
+    if server is None or not clients:
+        st.info("No saved federated results are available yet. Run the pipeline to generate metrics.")
     else:
-        pred_labels, true_labels = build_confusion_metrics(aggregated_client, val_data, class_names)
-        metrics = compute_classification_metrics(true_labels, pred_labels, list(class_names))
+        try:
+            final_result = compute_final_global_metrics(
+                server,
+                clients,
+                class_names,
+                global_validation_data=global_validation_data,
+                client_eval_data=client_eval_data,
+            )
+            metrics = final_result["metrics"]
+            pred_labels = final_result["pred_labels"]
+            true_labels = final_result["true_labels"]
+        except ValueError as exc:
+            st.warning(str(exc))
     metric_cols = st.columns(3)
     display_items = [
         ("Accuracy", metrics.get("accuracy")),
@@ -1326,11 +1439,11 @@ if run_button:
             else:
                 st.metric(name, f"{float(value):.4f}")
 
-    if len(clients) > 1 and combined_true and combined_pred:
-        confusion_fig = plot_confusion_matrix(np.asarray(combined_true), np.asarray(combined_pred), list(class_names))
-    else:
+    if pred_labels.size > 0 and true_labels.size > 0:
         confusion_fig = plot_confusion_matrix(true_labels, pred_labels, list(class_names))
-    st.pyplot(confusion_fig)
+        st.pyplot(confusion_fig)
+    else:
+        st.info("Final confusion matrix is unavailable because the real global validation dataset is empty or missing both classes.")
 
     st.subheader("EXPLAINABLE AI (LOCAL XAI)")
     st.caption("Medical Image → Local Trained CNN → Prediction → Local Grad-CAM → Heatmap/Explanation. Raw images are never transmitted to the federated server.")
