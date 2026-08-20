@@ -1278,8 +1278,6 @@ if run_button:
                 key="selected_round_number",
             )
 
-            st.session_state["selected_hospital_name"] = selected_hospital
-            st.session_state["selected_round_number"] = selected_round
             history = grouped_by_hospital[selected_hospital][selected_round]
             st.subheader(f"{selected_hospital} • Round {selected_round}")
 
