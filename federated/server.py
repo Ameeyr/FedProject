@@ -1,4 +1,5 @@
 import copy
+import json
 from pathlib import Path
 
 import numpy as np
@@ -50,6 +51,51 @@ class DummyFlowerProxy:
         self.cid = str(client_id)
 
 
+def _normalize_history_payload(history_dict):
+    if not isinstance(history_dict, dict):
+        return {}
+
+    normalized = {}
+    for key in ("loss", "accuracy", "val_loss", "val_accuracy"):
+        values = history_dict.get(key)
+        if values is None:
+            continue
+        try:
+            normalized[key] = [float(value) for value in np.asarray(values, dtype=np.float64).ravel()]
+        except (TypeError, ValueError):
+            normalized[key] = []
+    return normalized
+
+
+def _extract_final_history_metrics(history_dict):
+    if not isinstance(history_dict, dict):
+        return {"loss": 0.0, "accuracy": 0.0, "val_loss": 0.0, "val_accuracy": 0.0}
+
+    metric_names = (
+        ("loss", "loss"),
+        ("accuracy", "accuracy"),
+        ("val_loss", "val_loss"),
+        ("val_accuracy", "val_accuracy"),
+    )
+    final_metrics = {}
+    for canonical, preferred in metric_names:
+        values = history_dict.get(preferred)
+        if values is None:
+            for candidate in history_dict:
+                if candidate.lower() == canonical.lower() or candidate.lower() == preferred.lower():
+                    values = history_dict[candidate]
+                    break
+        if values is None:
+            final_metrics[canonical] = 0.0
+            continue
+        arr = np.asarray(values, dtype=np.float64).ravel()
+        if arr.size == 0:
+            final_metrics[canonical] = 0.0
+        else:
+            final_metrics[canonical] = float(arr[-1])
+    return final_metrics
+
+
 def run_flower_federation(
     clients,
     server,
@@ -74,6 +120,7 @@ def run_flower_federation(
 
     for round_idx in range(1, int(rounds) + 1):
         fit_results = []
+        round_local_histories = []
         for client in clients:
             dataset = None
             if client_datasets is not None:
@@ -101,13 +148,24 @@ def run_flower_federation(
                 val_data = (dataset[2], dataset[3])
 
             client.model.set_weights(parameters_to_ndarrays(current_parameters))
-            client.train_model(
+            history_dict = client.train_model(
                 train_data,
                 val_data,
                 epochs=int(epochs),
                 batch_size=int(batch_size),
                 callbacks=callbacks or [],
             )
+
+            local_history = _normalize_history_payload(history_dict)
+            final_metrics = _extract_final_history_metrics(local_history)
+            fit_result_metrics = {
+                "local_history": json.dumps(local_history),
+                "loss": final_metrics.get("loss", 0.0),
+                "accuracy": final_metrics.get("accuracy", 0.0),
+                "val_loss": final_metrics.get("val_loss", 0.0),
+                "val_accuracy": final_metrics.get("val_accuracy", 0.0),
+                "sample_count": int(len(train_data[0])),
+            }
             fit_results.append(
                 (
                     DummyFlowerProxy(client.client_id),
@@ -115,13 +173,26 @@ def run_flower_federation(
                         Status(Code.OK, "ok"),
                         ndarrays_to_parameters(client.model.get_weights()),
                         int(len(train_data[0])),
-                        {},
+                        fit_result_metrics,
                     ),
                 )
             )
+            round_local_histories.append({
+                "client_id": getattr(client, "client_id", "unknown"),
+                "federated_round": round_idx,
+                "history": local_history,
+                "sample_count": int(len(train_data[0])),
+            })
 
         if not fit_results:
             continue
+
+        server.client_histories.append({
+            "round": round_idx,
+            "clients": len(round_local_histories),
+            "mode": aggregation_mode,
+            "local_histories": round_local_histories,
+        })
 
         aggregated_params, metrics = strategy.aggregate_fit(round_idx, fit_results, failures=[])
         if aggregated_params is not None:
@@ -208,20 +279,7 @@ class FederatedFlowerServer:
         if client_weights is None:
             raise ValueError("Client weights are required for a federated update")
 
-        if self.global_weights is None:
-            self.global_weights = [np.array(weight, copy=True) for weight in client_weights]
-        else:
-            if self.aggregation_mode == "fedavg":
-                self.global_weights = [
-                    (self.global_weights[idx] * self.round + np.array(weight, copy=True)) / (self.round + 1)
-                    for idx, weight in enumerate(client_weights)
-                ]
-            else:
-                self.global_weights = [
-                    (self.global_weights[idx] * self.round + np.array(weight, copy=True)) / (self.round + 1)
-                    for idx, weight in enumerate(client_weights)
-                ]
-
+        self.global_weights = [np.array(weight, copy=True) for weight in client_weights]
         self.round += 1
         self.history.append({"round": self.round, "weights_shape": [np.shape(weight) for weight in self.global_weights], "mode": self.aggregation_mode})
         return self.global_weights
@@ -244,18 +302,54 @@ class FederatedFlowerServer:
 
     def aggregate_with_fedprox(self, client_weights_list, global_weights, sample_counts=None):
         self._validate_aggregation_mode()
+        weighted_averaged = self.aggregate_client_updates(client_weights_list, sample_counts=sample_counts)
+
         if self.aggregation_mode != "fedprox":
-            return self.aggregate_client_updates(client_weights_list, sample_counts=sample_counts)
+            return weighted_averaged
 
         if global_weights is None:
-            return self.aggregate_client_updates(client_weights_list, sample_counts=sample_counts)
+            return weighted_averaged
 
-        weighted_averaged = self.aggregate_client_updates(client_weights_list, sample_counts=sample_counts)
         proximal_updates = []
         for idx in range(len(client_weights_list[0])):
             global_arr = np.array(global_weights[idx], copy=True)
             proximal_updates.append(weighted_averaged[idx] + self.mu * (weighted_averaged[idx] - global_arr))
         return proximal_updates
+
+    @staticmethod
+    def _extract_loss_accuracy(evaluation_result, model=None):
+        if isinstance(evaluation_result, dict):
+            metric_names = list(getattr(model, "metrics_names", []) or [])
+            if "loss" in evaluation_result:
+                loss_value = float(evaluation_result["loss"])
+            else:
+                loss_key = next((key for key in evaluation_result if "loss" in key.lower() and key.lower() != "val_loss"), None)
+                loss_value = float(evaluation_result[loss_key]) if loss_key is not None else 0.0
+
+            accuracy_key = None
+            if "accuracy" in evaluation_result:
+                accuracy_key = "accuracy"
+            elif "acc" in evaluation_result:
+                accuracy_key = "acc"
+            elif metric_names:
+                for candidate in metric_names:
+                    if "acc" in candidate.lower() or "accuracy" in candidate.lower():
+                        accuracy_key = candidate
+                        break
+            if accuracy_key is None:
+                for key in evaluation_result:
+                    if "acc" in key.lower() or "accuracy" in key.lower():
+                        accuracy_key = key
+                        break
+            if accuracy_key is None:
+                raise ValueError("Model evaluation result does not include an accuracy-like metric.")
+            accuracy_value = float(evaluation_result[accuracy_key])
+            return loss_value, accuracy_value
+
+        if isinstance(evaluation_result, (list, tuple)) and len(evaluation_result) >= 2:
+            return float(evaluation_result[0]), float(evaluation_result[1])
+
+        raise TypeError("Model evaluation did not return a loss and accuracy value.")
 
     def evaluate_global_model(self, clients, eval_data):
         if not clients or eval_data is None:
@@ -290,14 +384,7 @@ class FederatedFlowerServer:
 
                 try:
                     evaluation_result = client.model.evaluate(eval_images, eval_labels, verbose=0)
-                    if isinstance(evaluation_result, dict):
-                        loss_value = float(evaluation_result.get("loss", evaluation_result.get("val_loss", 0.0)))
-                        accuracy_value = float(evaluation_result.get("accuracy", evaluation_result.get("val_accuracy", 0.0)))
-                    elif isinstance(evaluation_result, (list, tuple)) and len(evaluation_result) >= 2:
-                        loss_value = float(evaluation_result[0])
-                        accuracy_value = float(evaluation_result[1])
-                    else:
-                        raise TypeError("Model evaluation did not return loss and accuracy values.")
+                    loss_value, accuracy_value = self._extract_loss_accuracy(evaluation_result, model=client.model)
                 except Exception as exc:
                     raise RuntimeError(
                         f"Global evaluation failed during Round {self.round + 1} for client {client_id}: {exc}"
@@ -326,6 +413,8 @@ class FederatedFlowerServer:
                 "round": self.round,
                 "loss": float(weighted_loss),
                 "accuracy": float(weighted_accuracy),
+                "val_loss": float(weighted_loss),
+                "val_accuracy": float(weighted_accuracy),
                 "clients": len(local_metrics),
                 "local_validation_samples": total_validation_samples,
                 "hospital_metrics": hospital_diagnostics,
@@ -342,7 +431,8 @@ class FederatedFlowerServer:
             model_client.model.set_weights(self.global_weights)
 
         try:
-            loss, accuracy = model_client.model.evaluate(eval_images, eval_labels, verbose=0)
+            evaluation_result = model_client.model.evaluate(eval_images, eval_labels, verbose=0)
+            loss, accuracy = self._extract_loss_accuracy(evaluation_result, model=model_client.model)
         except Exception as exc:
             raise RuntimeError(
                 f"Global evaluation failed during Round {self.round + 1}: {exc}"
@@ -352,6 +442,8 @@ class FederatedFlowerServer:
             "round": self.round,
             "loss": float(loss),
             "accuracy": float(accuracy),
+            "val_loss": float(loss),
+            "val_accuracy": float(accuracy),
             "clients": len(clients),
         }
 

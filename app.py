@@ -160,13 +160,20 @@ def parse_hospital_dataset_paths(raw_value):
 def remap_labels_to_shared_classes(labels, class_names, shared_class_names):
     if not class_names or not shared_class_names:
         return labels
-    mapping = {class_name: idx for idx, class_name in enumerate(shared_class_names)}
-    remapped = np.asarray(labels, dtype=np.int32).copy()
+
     class_name_list = list(class_names)
-    for class_name, target_index in mapping.items():
-        if class_name in class_name_list:
-            original_index = class_name_list.index(class_name)
-            remapped[remapped == original_index] = target_index
+    if len(class_name_list) != len(set(class_name_list)):
+        raise ValueError("Local class names must be unique before remapping labels.")
+
+    shared_name_to_index = {class_name: idx for idx, class_name in enumerate(shared_class_names)}
+    local_to_shared = np.full(len(class_name_list), -1, dtype=np.int32)
+    for local_index, class_name in enumerate(class_name_list):
+        if class_name in shared_name_to_index:
+            local_to_shared[local_index] = shared_name_to_index[class_name]
+
+    remapped = np.asarray(labels, dtype=np.int32).copy()
+    valid_mask = (remapped >= 0) & (remapped < len(local_to_shared))
+    remapped[valid_mask] = local_to_shared[remapped[valid_mask]]
     return remapped.astype(np.int32)
 
 
@@ -1034,7 +1041,12 @@ if run_button:
         local_labels = hospital_dataset["labels"]
         if len(local_images) < 2:
             continue
-        local_train_data, local_val_data = split_train_val(local_images, local_labels, seed=7 + client_index)
+
+        local_train_data = hospital_dataset.get("train")
+        local_val_data = hospital_dataset.get("val")
+        if local_train_data is None or local_val_data is None:
+            local_train_data, local_val_data = split_train_val(local_images, local_labels, seed=7 + client_index)
+
         train_overlap, overlap_hashes = validate_train_validation_overlap(local_train_data[0], local_val_data[0])
         if train_overlap:
             st.error(f"DATA LEAKAGE DETECTED for Hospital {client_index}: {len(overlap_hashes)} duplicated image(s) across train and validation.")
@@ -1180,7 +1192,33 @@ if run_button:
         item.get("history", item) for item in history_by_client if isinstance(item, dict)
     ])
     final_global_eval = server.evaluate_global_model(clients, global_validation_data) if global_validation_data else None
-    accuracy = float(final_global_eval["accuracy"]) if isinstance(final_global_eval, dict) and "accuracy" in final_global_eval else 0.0
+    final_loss = float(final_global_eval.get("loss", final_global_eval.get("val_loss", 0.0))) if isinstance(final_global_eval, dict) else 0.0
+    final_accuracy = float(final_global_eval.get("accuracy", final_global_eval.get("val_accuracy", 0.0))) if isinstance(final_global_eval, dict) else 0.0
+    final_val_loss = float(final_global_eval.get("val_loss", final_loss)) if isinstance(final_global_eval, dict) else 0.0
+    final_val_accuracy = float(final_global_eval.get("val_accuracy", final_accuracy)) if isinstance(final_global_eval, dict) else 0.0
+    try:
+        final_result = compute_final_global_metrics(
+            server,
+            clients,
+            class_names,
+            global_validation_data=global_validation_data,
+            client_eval_data=client_eval_data,
+        )
+        classification_metrics = final_result["metrics"]
+        final_pred_labels = np.asarray(final_result["pred_labels"]).ravel()
+        final_true_labels = np.asarray(final_result["true_labels"]).ravel()
+    except ValueError:
+        classification_metrics = {
+            "accuracy": float(final_accuracy),
+            "precision": None,
+            "recall": None,
+            "f1_score": None,
+            "sensitivity": None,
+            "specificity": None,
+        }
+        final_pred_labels = np.array([], dtype=np.int32)
+        final_true_labels = np.array([], dtype=np.int32)
+    accuracy = float(final_accuracy)
 
     accuracy_status = "Met" if accuracy >= float(target_accuracy) else "Below target"
     if accuracy >= float(target_accuracy):
@@ -1209,11 +1247,13 @@ if run_button:
         },
         history_by_client=history_by_client,
         aggregated_history=history,
+        classification_metrics=classification_metrics,
         local_metrics=local_metrics,
         global_metrics=global_metrics,
-        accuracy=float(accuracy),
-        val_accuracy=None,
-        val_loss=None,
+        accuracy=float(final_accuracy),
+        val_accuracy=float(final_val_accuracy),
+        loss=float(final_loss),
+        val_loss=float(final_val_loss),
     )
     st.session_state["current_run_id"] = run_id
     st.session_state["last_run_history_by_client"] = history_by_client
@@ -1243,8 +1283,23 @@ if run_button:
             st.metric(label, str(value))
 
     st.markdown("## SECTION A: LOCAL CLIENT TRAINING")
-    if not history_by_client or server is None:
+    persisted_local_rows = load_run_local_metrics(db_path=metrics_db_path, run_id=st.session_state.get("current_run_id")) if metrics_db_path else []
+    persisted_history_by_hospital = {}
+    for row in persisted_local_rows:
+        hospital_name = str(row.get("client") or f"Hospital {row.get('hospital_id') or row.get('client_id') or 'Unknown'}")
+        round_number = int(row.get("federated_round", row.get("round", 1)))
+        grouped = persisted_history_by_hospital.setdefault(hospital_name, {}).setdefault(round_number, {"loss": [], "accuracy": [], "val_loss": [], "val_accuracy": []})
+        for metric_name in ("loss", "accuracy", "val_loss", "val_accuracy"):
+            value = row.get(metric_name)
+            if value is None:
+                continue
+            grouped.setdefault(metric_name, []).append(float(value))
+
+    if persisted_history_by_hospital:
+        grouped_by_hospital = persisted_history_by_hospital
+    elif not history_by_client or server is None:
         st.info("Run the federated pipeline first to generate hospital and round history.")
+        grouped_by_hospital = {}
     else:
         valid_history_entries = [entry for entry in history_by_client if isinstance(entry, dict) and has_valid_training_history(entry.get("history", entry))]
         if valid_history_entries:
@@ -1253,52 +1308,55 @@ if run_button:
                 hospital_id = entry.get("client_id", "unknown")
                 round_number = entry.get("federated_round", 1)
                 grouped_by_hospital.setdefault(f"Hospital {hospital_id}", {})[round_number] = entry.get("history", entry)
-
-            hospital_names = sorted(grouped_by_hospital, key=lambda name: str(name))
-            default_hospital = hospital_names[0]
-            selected_hospital = st.session_state.get("selected_hospital_name")
-            if selected_hospital not in hospital_names:
-                selected_hospital = default_hospital
-            selected_hospital = st.selectbox(
-                "Select Hospital",
-                options=hospital_names,
-                index=hospital_names.index(selected_hospital),
-                key="selected_hospital_name",
-            )
-
-            round_options = sorted(grouped_by_hospital[selected_hospital])
-            default_round = round_options[0]
-            selected_round = st.session_state.get("selected_round_number")
-            if selected_round not in round_options:
-                selected_round = default_round
-            selected_round = st.selectbox(
-                "Select Federated Round",
-                options=round_options,
-                index=round_options.index(selected_round),
-                key="selected_round_number",
-            )
-
-            history = grouped_by_hospital[selected_hospital][selected_round]
-            st.subheader(f"{selected_hospital} • Round {selected_round}")
-
-            metric_cols = st.columns(4)
-            metric_keys = ["loss", "val_loss", "accuracy", "val_accuracy"]
-            for col_idx, key in enumerate(metric_keys):
-                values = history.get(key, [])
-                value = float(np.asarray(values).reshape(-1)[-1]) if isinstance(values, (list, tuple, np.ndarray)) and np.asarray(values).size > 0 else None
-                label = {
-                    "loss": "Training Loss",
-                    "val_loss": "Validation Loss",
-                    "accuracy": "Training Accuracy",
-                    "val_accuracy": "Validation Accuracy",
-                }.get(key, key.replace("_", " ").title())
-                with metric_cols[col_idx]:
-                    st.metric(label, f"{value:.4f}" if value is not None else "N/A")
-
-            st.caption("X-axis = Epoch")
-            st.pyplot(plot_training_history(history))
         else:
-            st.info("Local client training history will appear here only after at least one hospital produces a valid local training history.")
+            grouped_by_hospital = {}
+
+    if grouped_by_hospital:
+        hospital_names = sorted(grouped_by_hospital, key=lambda name: str(name))
+        default_hospital = hospital_names[0]
+        selected_hospital = st.session_state.get("selected_hospital_name")
+        if selected_hospital not in hospital_names:
+            selected_hospital = default_hospital
+        selected_hospital = st.selectbox(
+            "Select Hospital",
+            options=hospital_names,
+            index=hospital_names.index(selected_hospital),
+            key="selected_hospital_name",
+        )
+
+        round_options = sorted(grouped_by_hospital[selected_hospital])
+        default_round = round_options[0]
+        selected_round = st.session_state.get("selected_round_number")
+        if selected_round not in round_options:
+            selected_round = default_round
+        selected_round = st.selectbox(
+            "Select Federated Round",
+            options=round_options,
+            index=round_options.index(selected_round),
+            key="selected_round_number",
+        )
+
+        history = grouped_by_hospital[selected_hospital][selected_round]
+        st.subheader(f"{selected_hospital} • Round {selected_round}")
+
+        metric_cols = st.columns(4)
+        metric_keys = ["loss", "val_loss", "accuracy", "val_accuracy"]
+        for col_idx, key in enumerate(metric_keys):
+            values = history.get(key, [])
+            value = float(np.asarray(values).reshape(-1)[-1]) if isinstance(values, (list, tuple, np.ndarray)) and np.asarray(values).size > 0 else None
+            label = {
+                "loss": "Training Loss",
+                "val_loss": "Validation Loss",
+                "accuracy": "Training Accuracy",
+                "val_accuracy": "Validation Accuracy",
+            }.get(key, key.replace("_", " ").title())
+            with metric_cols[col_idx]:
+                st.metric(label, f"{value:.4f}" if value is not None else "N/A")
+
+        st.caption("X-axis = Epoch")
+        st.pyplot(plot_training_history(history))
+    else:
+        st.info("Local client training history will appear here only after at least one hospital produces a valid local training history.")
 
     st.markdown("## SECTION B: GLOBAL FEDERATED TRAINING")
     if server is not None and getattr(server, "global_round_metrics", None):
@@ -1469,8 +1527,9 @@ if run_button:
 
     if selected_run_metrics:
         st.caption(f"Active run: {selected_run_id}")
+        stored_metrics = selected_run_metrics.get("classification_metrics") or {}
         st.code(
-            f"run_id={selected_run_id}\nmodel={selected_run_metrics.get('model_name')}\naggregation={selected_run_metrics.get('aggregation_mode')}\naccuracy={selected_run_metrics.get('accuracy')}\nval_accuracy={selected_run_metrics.get('val_accuracy')}",
+            f"run_id={selected_run_id}\nmodel={selected_run_metrics.get('model_name')}\naggregation={selected_run_metrics.get('aggregation_mode')}\naccuracy={selected_run_metrics.get('accuracy')}\nval_accuracy={selected_run_metrics.get('val_accuracy')}\nfinal_precision={stored_metrics.get('precision')}\nfinal_recall={stored_metrics.get('recall')}\nfinal_f1={stored_metrics.get('f1_score')}\nfinal_specificity={stored_metrics.get('specificity')}",
             language="text",
         )
 

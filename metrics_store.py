@@ -39,6 +39,17 @@ def _ensure_metric_rows(metrics):
     return []
 
 
+def _decode_json_field(value):
+    if value in (None, ""):
+        return None
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except (TypeError, ValueError):
+            return value
+    return value
+
+
 def initialize_metrics_db(db_path=DEFAULT_METRICS_DB):
     connection = _connect(db_path)
     try:
@@ -255,7 +266,36 @@ def load_run_metrics_by_id(db_path=DEFAULT_METRICS_DB, run_id=None):
         ).fetchone()
         if row is None:
             return None
-        return dict(row)
+
+        row_dict = dict(row)
+        row_dict["classification_metrics"] = _decode_json_field(row_dict.get("classification_metrics_json"))
+        row_dict["local_metrics"] = _decode_json_field(row_dict.get("local_metrics_json"))
+        row_dict["global_metrics"] = _decode_json_field(row_dict.get("global_metrics_json"))
+        return row_dict
+    finally:
+        connection.close()
+
+
+def load_recent_metrics(db_path=DEFAULT_METRICS_DB, limit=10):
+    connection = _connect(db_path)
+    try:
+        rows = connection.execute(
+            """
+            SELECT *
+            FROM run_metrics
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        decoded_rows = []
+        for row in rows:
+            row_dict = dict(row)
+            row_dict["classification_metrics"] = _decode_json_field(row_dict.get("classification_metrics_json"))
+            row_dict["local_metrics"] = _decode_json_field(row_dict.get("local_metrics_json"))
+            row_dict["global_metrics"] = _decode_json_field(row_dict.get("global_metrics_json"))
+            decoded_rows.append(row_dict)
+        return decoded_rows
     finally:
         connection.close()
 
@@ -296,23 +336,6 @@ def list_run_ids(db_path=DEFAULT_METRICS_DB, limit=20):
             (int(limit),),
         ).fetchall()
         return [str(row["run_id"]) for row in rows if row["run_id"]]
-    finally:
-        connection.close()
-
-
-def load_recent_metrics(db_path=DEFAULT_METRICS_DB, limit=10):
-    connection = _connect(db_path)
-    try:
-        rows = connection.execute(
-            """
-            SELECT *
-            FROM run_metrics
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (limit,),
-        ).fetchall()
-        return [dict(row) for row in rows]
     finally:
         connection.close()
 

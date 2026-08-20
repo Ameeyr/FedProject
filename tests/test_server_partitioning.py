@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 import tensorflow as tf
 
-from app import run_multi_client_federation
+from app import run_flower_federation, run_multi_client_federation
 from federated.server import (
     FederatedFlowerServer,
     build_flower_strategy,
@@ -51,6 +51,54 @@ def test_local_training_returns_actual_keras_history_for_requested_epoch_count()
     assert len(history["accuracy"]) == 5
     assert len(history["val_loss"]) == 5
     assert len(history["val_accuracy"]) == 5
+
+
+def test_flower_round_keeps_complete_local_history_for_each_client():
+    if not is_flower_available():
+        pytest.skip("Flower is not installed in this environment")
+
+    class TinyClient(FederatedClient):
+        def build_model(self, model_name, num_classes):
+            model = tf.keras.Sequential([
+                tf.keras.layers.Input(shape=(4,)),
+                tf.keras.layers.Dense(8, activation="relu"),
+                tf.keras.layers.Dense(1, activation="sigmoid"),
+            ])
+            model.compile(optimizer="adam", loss="binary_crossentropy", metrics=["accuracy"])
+            return model
+
+    clients = [
+        TinyClient(client_id=1, server_address="local", model_name="tiny", num_classes=1),
+        TinyClient(client_id=2, server_address="local", model_name="tiny", num_classes=1),
+    ]
+    server = FederatedFlowerServer(aggregation_mode="fedavg")
+    train_images = np.random.rand(32, 4).astype(np.float32)
+    train_labels = np.array([0, 1] * 16, dtype=np.float32)
+    val_images = np.random.rand(16, 4).astype(np.float32)
+    val_labels = np.array([0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 1, 0, 1, 0], dtype=np.float32)
+
+    round_datasets = {
+        1: {
+            1: {"train": (train_images[:16], train_labels[:16]), "val": (val_images[:8], val_labels[:8])},
+            2: {"train": (train_images[16:], train_labels[16:]), "val": (val_images[8:], val_labels[8:])},
+        }
+    }
+
+    run_flower_federation(
+        clients,
+        server,
+        rounds=1,
+        client_datasets=round_datasets[1],
+        epochs=3,
+        batch_size=4,
+        eval_data={1: (val_images[:8], val_labels[:8]), 2: (val_images[8:], val_labels[8:])},
+        aggregation_mode="fedavg",
+    )
+
+    assert len(server.client_histories) == 1
+    assert len(server.client_histories[0]["local_histories"]) == 2
+    assert all("history" in item for item in server.client_histories[0]["local_histories"])
+    assert all(len(item["history"]["loss"]) == 3 for item in server.client_histories[0]["local_histories"])
 
 
 def test_federated_rounds_retrain_clients_between_rounds():
@@ -110,7 +158,20 @@ def test_server_checkpoint_save_and_load_roundtrip_preserves_global_weights():
     assert np.allclose(restored.global_weights[1], np.array([[3.0, 4.0]], dtype=np.float32))
 
 
-def test_global_evaluation_metrics_are_not_fabricated_as_validation_metrics():
+def test_server_update_global_model_uses_single_aggregated_weights_only():
+    server = FederatedFlowerServer(aggregation_mode="fedavg")
+    server.global_weights = [np.array([1.0, 2.0], dtype=np.float32)]
+    server.round = 1
+
+    aggregated = [np.array([9.0, 11.0], dtype=np.float32)]
+    updated = server.update_global_model(aggregated)
+
+    assert np.allclose(updated[0], np.array([9.0, 11.0], dtype=np.float32))
+    assert server.round == 2
+    assert np.allclose(server.global_weights[0], np.array([9.0, 11.0], dtype=np.float32))
+
+
+def test_global_evaluation_reports_real_validation_loss_and_accuracy():
     class DummyModel:
         def __init__(self):
             self.weights = [np.array([1.0], dtype=np.float32)]
@@ -137,15 +198,14 @@ def test_global_evaluation_metrics_are_not_fabricated_as_validation_metrics():
 
     assert metrics["loss"] == 0.75
     assert metrics["accuracy"] == 0.80
-    assert "val_loss" not in metrics
-    assert "val_accuracy" not in metrics
+    assert metrics["val_loss"] == 0.75
+    assert metrics["val_accuracy"] == 0.80
 
 
-def test_global_evaluation_aggregates_per_client_validation_metrics_only():
+def test_global_evaluation_uses_new_global_model_validation_metrics():
     class DummyModel:
-        def __init__(self, client_id):
-            self.client_id = client_id
-            self.weights = [np.array([float(client_id)], dtype=np.float32)]
+        def __init__(self):
+            self.weights = [np.array([1.0], dtype=np.float32)]
 
         def get_weights(self):
             return [np.array(weight, copy=True) for weight in self.weights]
@@ -154,30 +214,23 @@ def test_global_evaluation_aggregates_per_client_validation_metrics_only():
             self.weights = [np.array(weight, copy=True) for weight in weights]
 
         def evaluate(self, images, labels, verbose=0):
-            if self.client_id == 1:
-                return 0.50, 0.80
-            return 0.30, 0.90
+            return 0.75, 0.80
 
     class DummyClient:
-        def __init__(self, client_id):
-            self.client_id = client_id
-            self.model = DummyModel(client_id)
+        def __init__(self):
+            self.client_id = 1
+            self.model = DummyModel()
 
-    clients = [DummyClient(1), DummyClient(2)]
     server = FederatedFlowerServer(aggregation_mode="fedavg")
     server.global_weights = [np.array([1.0], dtype=np.float32)]
+    client = DummyClient()
 
-    metrics = server.evaluate_global_model(
-        clients,
-        {
-            1: (np.ones((3, 1)), np.array([0, 1, 0])),
-            2: (np.ones((1, 1)), np.array([1])),
-        },
-    )
+    metrics = server.evaluate_global_model([client], (np.ones((2, 1)), np.array([0, 1])))
 
-    assert metrics["loss"] == pytest.approx(0.45)
-    assert metrics["accuracy"] == pytest.approx(0.825)
-    assert metrics["clients"] == 2
+    assert metrics["loss"] == pytest.approx(0.75)
+    assert metrics["accuracy"] == pytest.approx(0.80)
+    assert metrics["val_loss"] == pytest.approx(0.75)
+    assert metrics["val_accuracy"] == pytest.approx(0.80)
 
 
 def test_global_evaluation_failure_is_reported_not_hidden():

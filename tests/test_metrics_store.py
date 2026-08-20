@@ -2,7 +2,7 @@ import json
 import sqlite3
 
 from app import build_local_metrics, resolve_active_run_id
-from metrics_store import initialize_metrics_db, load_recent_metrics, save_run_metrics
+from metrics_store import initialize_metrics_db, load_recent_metrics, load_run_metrics_by_id, save_run_metrics
 
 
 def test_initialize_metrics_db_migrates_existing_table_without_new_column(tmp_path):
@@ -138,6 +138,31 @@ def test_global_metrics_without_validation_data_stay_unset(tmp_path):
         assert rows[1][2] is None
     finally:
         connection.close()
+
+
+def test_save_run_metrics_round_trips_classification_metrics(tmp_path):
+    db_path = tmp_path / "classification_metrics.db"
+    classification_metrics = {
+        "accuracy": 0.89,
+        "precision": 0.88,
+        "recall": 0.87,
+        "f1_score": 0.86,
+        "sensitivity": 0.85,
+        "specificity": 0.84,
+    }
+
+    run_id = save_run_metrics(
+        db_path=db_path,
+        model_name="efficientnetb0",
+        aggregation_mode="fedavg",
+        config={"rounds": 1},
+        classification_metrics=classification_metrics,
+    )
+
+    loaded = load_run_metrics_by_id(db_path=db_path, run_id=run_id)
+    assert loaded is not None
+    assert loaded["classification_metrics"]["accuracy"] == 0.89
+    assert json.loads(loaded["classification_metrics_json"])["f1_score"] == 0.86
 
 
 def test_save_run_metrics_stores_local_and_global_metrics_with_run_id(tmp_path):
