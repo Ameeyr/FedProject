@@ -92,6 +92,24 @@ def test_federated_rounds_retrain_clients_between_rounds():
     assert all(client.model.weights[0][0] > 0 for client in clients)
 
 
+def test_server_checkpoint_save_and_load_roundtrip_preserves_global_weights():
+    server = FederatedFlowerServer(aggregation_mode="fedavg")
+    server.global_weights = [np.array([1.5, 2.5], dtype=np.float32), np.array([[3.0, 4.0]], dtype=np.float32)]
+    server.round = 3
+    server.history = [{"round": 1, "mode": "fedavg"}, {"round": 2, "mode": "fedavg"}, {"round": 3, "mode": "fedavg"}]
+
+    checkpoint = "tmp_server_state.npz"
+    server.save_state(checkpoint)
+
+    restored = FederatedFlowerServer(aggregation_mode="fedavg")
+    restored.load_state(checkpoint)
+
+    assert restored.round == 3
+    assert len(restored.global_weights) == 2
+    assert np.allclose(restored.global_weights[0], np.array([1.5, 2.5], dtype=np.float32))
+    assert np.allclose(restored.global_weights[1], np.array([[3.0, 4.0]], dtype=np.float32))
+
+
 def test_global_evaluation_metrics_are_not_fabricated_as_validation_metrics():
     class DummyModel:
         def __init__(self):

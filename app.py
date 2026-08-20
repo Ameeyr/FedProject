@@ -48,6 +48,12 @@ HOSPITAL_CLASS_NAME_TO_ID = {"healthy": 0, "parkinson": 1}
 HOSPITAL_CLASS_NAMES = ["healthy", "parkinson"]
 
 
+def resolve_model_checkpoint_path(result_dir, model_name):
+    checkpoint_dir = Path(result_dir).expanduser() / "checkpoints"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    return checkpoint_dir / f"{model_name}_global_state.npz"
+
+
 def resolve_dataset_path(dataset_path, uploaded_files):
     raw_path = (dataset_path or "").strip()
     if not raw_path:
@@ -166,10 +172,11 @@ def remap_labels_to_shared_classes(labels, class_names, shared_class_names):
 
 def _list_supported_image_files(directory):
     directory = Path(directory).expanduser().resolve()
-    if not directory.exists():
+    if not directory.exists() or not directory.is_dir():
         return []
     return sorted(
-        path for path in directory.rglob("*")
+        path
+        for path in directory.iterdir()
         if path.is_file() and path.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS
     )
 
@@ -1000,6 +1007,12 @@ if run_button:
     st.success("Initialized global model and hospital clients for federated training")
 
     server = FederatedFlowerServer(model_name=model_name, aggregation_mode=aggregation_mode, mu=proximal_mu)
+    checkpoint_path = resolve_model_checkpoint_path(result_dir, model_name)
+    restored_state = server.load_state(checkpoint_path)
+    if restored_state is not None:
+        for client in clients:
+            client.model.set_weights(server.global_weights)
+        st.caption(f"Loaded previous federated model state from {checkpoint_path}")
     with st.spinner("Running federated rounds: each hospital receives the global model, trains locally for the configured epochs, and sends updates for aggregation..."):
         if len(class_names) >= 2 and len(clients) >= 2:
             if federation_backend == "flower":
@@ -1057,6 +1070,10 @@ if run_button:
                     batch_size=int(batch_size),
                     eval_data={1: single_client_eval} if len(clients) == 1 else single_client_eval,
                 )
+
+    if server.global_weights is not None:
+        server.save_state(checkpoint_path)
+        _append_run_log(f"Saved federated model checkpoint to {checkpoint_path}")
 
     aggregated_client = clients[0]
     if server.global_weights is not None:

@@ -455,14 +455,51 @@ class FederatedFlowerServer:
 
     def save_state(self, output_path):
         output_path = Path(output_path)
+        if self.global_weights is None:
+            return None
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        np.savez(output_path, *self.global_weights)
+
+        payload = {
+            "round": np.asarray(int(self.round), dtype=np.int64),
+            "aggregation_mode": np.asarray(str(self.aggregation_mode), dtype="U32"),
+            "history": np.asarray(self.history, dtype=object),
+        }
+        for idx, weight in enumerate(self.global_weights):
+            payload[f"weight_{idx}"] = np.asarray(weight)
+
+        np.savez(output_path, **payload)
+        return output_path
 
     def load_state(self, output_path):
         output_path = Path(output_path)
         if not output_path.exists():
             return None
-        loaded = np.load(output_path, allow_pickle=True)
-        self.global_weights = [loaded[name] for name in loaded.files]
-        self.round = max(1, len(self.history) + 1)
+
+        with np.load(output_path, allow_pickle=True) as loaded:
+            weight_keys = [key for key in loaded.files if key.startswith("weight_")]
+            if weight_keys:
+                self.global_weights = [np.asarray(loaded[key]) for key in sorted(weight_keys, key=lambda key: int(key.split("_")[-1]))]
+            else:
+                self.global_weights = None
+
+            if "round" in loaded.files:
+                self.round = int(np.asarray(loaded["round"]).item())
+            else:
+                self.round = max(1, len(self.history) + 1)
+
+            if "history" in loaded.files:
+                history_value = loaded["history"]
+                if isinstance(history_value, np.ndarray) and history_value.dtype == object:
+                    self.history = history_value.tolist()
+                else:
+                    self.history = history_value.tolist() if hasattr(history_value, "tolist") else list(history_value)
+            elif self.history:
+                self.history = self.history
+            else:
+                self.history = []
+
+            if "aggregation_mode" in loaded.files:
+                mode_value = np.asarray(loaded["aggregation_mode"]).item()
+                self.aggregation_mode = str(mode_value).lower() if mode_value is not None else self.aggregation_mode
+
         return self.global_weights

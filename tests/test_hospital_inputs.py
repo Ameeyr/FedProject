@@ -12,6 +12,31 @@ def test_hospital_inputs_require_hospital_paths_or_uploaded_images():
     assert validate_hospital_inputs([], ["image.png"]) is True
 
 
+def test_validate_hospital_dataset_ignores_subject_folders_and_reads_only_direct_class_images(tmp_path):
+    from app import validate_hospital_dataset
+
+    hospital = tmp_path / "Hospital_1"
+    healthy_dir = hospital / "healthy"
+    parkinson_dir = hospital / "parkinson"
+    healthy_dir.mkdir(parents=True)
+    parkinson_dir.mkdir(parents=True)
+
+    (healthy_dir / "healthy_000001.png").write_bytes(b"png")
+    (healthy_dir / "healthy_000002.png").write_bytes(b"png")
+    (parkinson_dir / "parkinson_000001.png").write_bytes(b"png")
+
+    nested_subject = healthy_dir / "Subject01"
+    nested_subject.mkdir()
+    (nested_subject / "ignored.png").write_bytes(b"png")
+
+    summary = validate_hospital_dataset(hospital)
+
+    assert summary["healthy_count"] == 2
+    assert summary["parkinson_count"] == 1
+    assert summary["total_images"] == 3
+    assert np.array_equal(summary["labels"], np.array([0, 0, 1], dtype=np.int32))
+
+
 def test_real_hospital_dataset_has_both_classes_and_stratified_validation():
     from app import validate_hospital_dataset, split_hospital_train_validation
 
